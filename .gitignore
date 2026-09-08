@@ -1,0 +1,4 @@
+# logy a testovací výstupy
+*.log
+_bkptest_*/
+.DS_Store
