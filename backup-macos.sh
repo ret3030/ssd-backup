@@ -131,6 +131,47 @@ ask() {
 banner
 
 # --------------------------------------------------------------------------
+# Kontrola prerekvizit
+# --------------------------------------------------------------------------
+
+need() { command -v "$1" >/dev/null 2>&1; }
+
+RSYNC_KIND="old"     # modern | openrsync | old
+
+check_prereqs() {
+  local miss=()
+  need rsync || miss+=( rsync )
+  need df    || miss+=( df )
+  need stat  || miss+=( stat )
+  if (( ${#miss[@]} )); then
+    err "Chybí nástroje: ${miss[*]}"
+    need rsync || info "Nainstaluj rsync: brew install rsync   (nebo Xcode Command Line Tools: xcode-select --install)"
+    exit 1
+  fi
+
+  local rv v
+  rv="$(rsync --version 2>&1 || true)"
+  v="$(printf '%s\n' "$rv" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)"
+  if [[ "$rv" == *openrsync* ]]; then
+    RSYNC_KIND="openrsync"
+  elif [[ "$rv" =~ version\ ([0-9]+)\. ]] && (( ${BASH_REMATCH[1]:-0} >= 3 )); then
+    RSYNC_KIND="modern"
+  fi
+
+  case "$RSYNC_KIND" in
+    modern)
+      ok "Prerekvizity v pořádku (rsync ${v}, plná záloha vč. ACL/xattr)." ;;
+    openrsync)
+      warn "Používáš systémový openrsync – záloha funguje, ale nepřenáší ACL, rozšířené atributy ani resource forky."
+      info "Pro plnou zálohu: brew install rsync (skript ho pak použije automaticky)." ;;
+    *)
+      warn "Starý rsync ${v:-?} – funguje omezeně. Doporučeno: brew install rsync." ;;
+  esac
+}
+
+check_prereqs
+
+# --------------------------------------------------------------------------
 # Průvodce
 # --------------------------------------------------------------------------
 
@@ -212,21 +253,25 @@ fi
 # --------------------------------------------------------------------------
 
 run_backup() {
-  local dry="$1" rc=0 log opts=()
-  log="$DEST/backup/backup-$(date +%Y%m%d-%H%M%S)-$HOSTDIR$([[ $dry -eq 1 ]] && echo '-dryrun').log"
+  local dry="$1" rc=0 log opts=() sfx=""
+  (( dry )) && sfx="-dryrun"
+  log="$DEST/backup/backup-$(date +%Y%m%d-%H%M%S)-$HOSTDIR$sfx.log"
 
-  # -a bez -X pro kompatibilitu se systémovým rsyncem; -E zachová resource forky/xattr
-  opts=( -a -E --human-readable --prune-empty-dirs )
-  if rsync --version 2>/dev/null | head -1 | grep -qE 'version 3\.'; then
-    opts+=( --info=progress2 )
+  if [[ "$RSYNC_KIND" == "modern" ]]; then
+    # Homebrew rsync 3.x – plná záloha
+    opts=( -aAX -E --human-readable --prune-empty-dirs --info=progress2 )
+    (( MIRROR )) && opts+=( --delete --delete-excluded )
   else
-    opts+=( --progress )
+    # systémový openrsync / starý rsync – jen bezpečné, široce podporované volby
+    opts=( -a --progress )
+    (( MIRROR )) && opts+=( --delete )
   fi
-  (( MIRROR )) && opts+=( --delete --delete-excluded )
-  (( dry ))    && opts+=( --dry-run )
+  (( dry )) && opts+=( --dry-run )
   for pat in "${EXCLUDES[@]}"; do opts+=( --exclude="$pat" ); done
 
-  step "Záloha${dry:+  ${YL}(ZKUŠEBNÍ BĚH – nic se nezapíše)${R}}"
+  local hdr="Záloha"
+  (( dry )) && hdr="Záloha  ${YL}(ZKUŠEBNÍ BĚH – nic se nezapíše)${R}"
+  step "$hdr"
   kv "Zdrojů"  "${#EXISTING[@]} složek"
   kv "Cíl"     "$TARGET"
   kv "Režim"   "$([[ $MIRROR -eq 1 ]] && echo 'zrcadlo (maže i na SSD)' || echo 'jen přidává')"

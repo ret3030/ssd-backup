@@ -6,7 +6,8 @@ to, co se změnilo. Cloudové složky (ownCloud, Nextcloud, iCloud, Dropbox…) 
 **nezálohují**.
 
 Každý skript má průvodce s barevným výstupem: spusť ho bez argumentů a provede tě
-krok za krokem – najde připojené disky, zeptá se na režim a nabídne zkušební běh.
+krok za krokem – **zkontroluje prerekvizity** (rsync / robocopy, awk, lsblk…),
+najde připojené disky, zeptá se na režim a nabídne zkušební běh.
 
 by [@ret3030](https://github.com/ret3030)
 
@@ -35,8 +36,9 @@ by [@ret3030](https://github.com/ret3030)
 ./backup-macos.sh /Volumes/MujSSD --no-mirror
 ```
 
-Pro plnohodnotné `rsync` (progress, ACL) doporučuju `brew install rsync` –
-skript si novější verzi automaticky vezme.
+Novější macOS má místo `rsync` jen systémový **openrsync** – záloha funguje, ale
+nepřenáší ACL, rozšířené atributy ani resource forky. Pro plnou zálohu:
+`brew install rsync` – skript si verzi 3.x automaticky vezme a přidá `-aAX`.
 
 ## Windows
 

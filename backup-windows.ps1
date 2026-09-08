@@ -69,6 +69,35 @@ function Ask([string]$Question, [string]$Default = 'N') {
     return ($ans -match '^[AaYy]')
 }
 
+function Step([string]$m) { Write-Host "`n> $m" -ForegroundColor Cyan }
+function Ok([string]$m)   { Write-Host "OK  $m"  -ForegroundColor Green }
+function Warn2([string]$m){ Write-Host "!   $m"  -ForegroundColor Yellow }
+
+function Show-Banner {
+    $rule = ('=' * 46)
+    Write-Host ""
+    Write-Host "  $rule"                          -ForegroundColor Cyan
+    Write-Host "   * SSD BACKUP  -  osobni soubory" -ForegroundColor Cyan
+    Write-Host "   zaloha domacich dat na externi disk" -ForegroundColor DarkGray
+    Write-Host "   by @ret3030"                    -ForegroundColor Magenta
+    Write-Host "  $rule"                          -ForegroundColor Cyan
+    Write-Host ""
+}
+
+function Test-Prereqs {
+    if (-not (Get-Command robocopy.exe -ErrorAction SilentlyContinue)) {
+        Write-Error "robocopy nenalezen. Je soucasti Windows (Vista+) v C:\Windows\System32 - zkontroluj PATH."
+    }
+    if ($PSVersionTable.PSVersion.Major -lt 3) {
+        Warn2 "Stara verze PowerShellu ($($PSVersionTable.PSVersion)). Doporuceno 3+ (Windows 8 / Server 2012 a novejsi)."
+    }
+    $rv = (Get-Command robocopy.exe).Version
+    Ok "Prerekvizity v poradku (robocopy $rv, PowerShell $($PSVersionTable.PSVersion))."
+}
+
+Show-Banner
+Test-Prereqs
+
 # --------------------------------------------------------------------------
 # Průvodce (když není zadaný -Dest)
 # --------------------------------------------------------------------------

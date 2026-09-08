@@ -136,6 +136,35 @@ ask() {  # ask "otázka" "A|N"  -> návrat 0 pro ano; druhý arg = výchozí
 banner
 
 # --------------------------------------------------------------------------
+# Kontrola prerekvizit
+# --------------------------------------------------------------------------
+
+need() { command -v "$1" >/dev/null 2>&1; }
+
+check_prereqs() {
+  local miss=()
+  need rsync || miss+=( rsync )
+  need awk   || miss+=( awk )
+  need tee   || miss+=( coreutils )
+  if (( ${#miss[@]} )); then
+    err "Chybí nástroje: ${miss[*]}"
+    if   need apt-get; then info "Nainstaluj: sudo apt install ${miss[*]}"
+    elif need dnf;     then info "Nainstaluj: sudo dnf install ${miss[*]}"
+    elif need pacman;  then info "Nainstaluj: sudo pacman -S ${miss[*]}"
+    elif need zypper;  then info "Nainstaluj: sudo zypper install ${miss[*]}"
+    fi
+    exit 1
+  fi
+  need lsblk || warn "lsblk nenalezen – průvodce nenabídne seznam disků, cestu zadáš ručně."
+  local v
+  v="$(rsync --version 2>/dev/null | head -1 || true)"
+  v="$(printf '%s\n' "$v" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)"
+  ok "Prerekvizity v pořádku (rsync ${v:-?})."
+}
+
+check_prereqs
+
+# --------------------------------------------------------------------------
 # Průvodce (když není zadaný cíl a jsme v terminálu)
 # --------------------------------------------------------------------------
 
@@ -217,11 +246,12 @@ fi
 # --------------------------------------------------------------------------
 
 run_backup() {
-  local dry="$1" rc=0 log opts=()
-  log="$DEST/backup/backup-$(date +%Y%m%d-%H%M%S)-$HOSTDIR$([[ $dry -eq 1 ]] && echo '-dryrun').log"
+  local dry="$1" rc=0 log opts=() sfx=""
+  (( dry )) && sfx="-dryrun"
+  log="$DEST/backup/backup-$(date +%Y%m%d-%H%M%S)-$HOSTDIR$sfx.log"
 
   opts=( -aAX --human-readable --prune-empty-dirs )
-  if rsync --version 2>/dev/null | head -1 | grep -qE 'version 3\.'; then
+  if [[ "$(rsync --version 2>/dev/null || true)" == *"version 3."* ]]; then
     opts+=( --info=progress2 )
   else
     opts+=( --progress )
@@ -230,7 +260,9 @@ run_backup() {
   (( dry ))    && opts+=( --dry-run )
   for pat in "${EXCLUDES[@]}"; do opts+=( --exclude="$pat" ); done
 
-  step "Záloha${dry:+  ${YL}(ZKUŠEBNÍ BĚH – nic se nezapíše)${R}}"
+  local hdr="Záloha"
+  (( dry )) && hdr="Záloha  ${YL}(ZKUŠEBNÍ BĚH – nic se nezapíše)${R}"
+  step "$hdr"
   kv "Zdrojů"  "${#EXISTING[@]} složek"
   kv "Cíl"     "$TARGET"
   kv "Režim"   "$([[ $MIRROR -eq 1 ]] && echo 'zrcadlo (maže i na SSD)' || echo 'jen přidává')"
