@@ -70,6 +70,7 @@ EXCLUDES=(
   "*~"
   ".venv"
   "venv"
+  "*venv*"
   "node_modules"
   "__pycache__"
   ".gradle"
@@ -740,10 +741,26 @@ run_backup() {
 
     printf '\n  %s%s[%d/%d]%s %s\n' "${CY}▸${R}" "$B" "$i" "$n" "$R" "$src"
     t="$SECONDS"
-    set +e
-    rsync "${opts[@]}" --log-file="$log" "$src" "$destdir/"
-    rc=$?
-    set -e
+    local try=1 max_try=1
+    # exFAT/FAT: kernel driver umí zpozdit zápis metadat nového adresáře,
+    # takže rsync na něj chvíli po vytvoření nedostane "open" (ENOENT) – při
+    # dalším průchodu už adresář existuje a soubor projde. Zkusíme to samé
+    # znovu, než to nahlásíme jako chybu.
+    (( CROSSFS )) && max_try=3
+    while :; do
+      set +e
+      rsync "${opts[@]}" --log-file="$log" "$src" "$destdir/"
+      rc=$?
+      set -e
+      if [[ "$rc" == 0 || "$rc" == 24 ]]; then break; fi
+      if (( CROSSFS )) && [[ "$rc" == 23 ]] && (( try < max_try )); then
+        warn "rc=23 (exFAT – adresář ještě \"nedopsaný\") – zkouším znovu [$((try+1))/$max_try]…"
+        sync; sleep 1
+        ((try++))
+        continue
+      fi
+      break
+    done
     dt=$(( SECONDS - t ))
     case "$rc" in
       0)  info "hotovo za ${dt}s" ;;

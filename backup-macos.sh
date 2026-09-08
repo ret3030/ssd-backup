@@ -60,6 +60,7 @@ EXCLUDES=(
   "*~"
   ".venv"
   "venv"
+  "*venv*"
   "node_modules"
   "__pycache__"
   ".gradle"
