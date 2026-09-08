@@ -11,6 +11,8 @@
 #   ./backup-linux.sh --label "WD SSD"         # cíl podle štítku (připojí se sám)
 #   ./backup-linux.sh --uuid 1234-ABCD --save  # zapamatovat disk do ~/.config/ssd-backup/
 #   ./backup-linux.sh --yes                    # bez dotazů; použije zapamatovaný disk (cron)
+#   ./backup-linux.sh --show-target            # který disk je zapamatovaný
+#   ./backup-linux.sh --forget                 # zapamatovaný disk smazat
 #
 #   Další přepínače:
 #   --no-mirror       nemazat na SSD soubory smazané ve zdroji
@@ -128,6 +130,8 @@ DO_UMOUNT=0
 UMOUNT_SET=0
 DO_POWEROFF=0
 SAVE_TARGET=0
+FORGET_TARGET=0
+SHOW_TARGET=0
 WIPE=0
 WIPE_FS=""
 
@@ -141,13 +145,15 @@ while (($#)); do
     --no-umount)        DO_UMOUNT=0; UMOUNT_SET=1 ;;
     --poweroff)         DO_UMOUNT=1; UMOUNT_SET=1; DO_POWEROFF=1 ;;
     --save)             SAVE_TARGET=1 ;;
+    --forget)           FORGET_TARGET=1 ;;
+    --show-target)      SHOW_TARGET=1 ;;
     --wipe|--format)    WIPE=1 ;;
     --wipe=*|--format=*) WIPE=1; WIPE_FS="${1#*=}" ;;
     --uuid)             shift || true; WANT_UUID="${1:-}" ;;
     --uuid=*)           WANT_UUID="${1#*=}" ;;
     --label)            shift || true; WANT_LABEL="${1:-}" ;;
     --label=*)          WANT_LABEL="${1#*=}" ;;
-    -h|--help)          sed -n '3,24p' "$0" | sed 's/^#\s\{0,1\}//'; exit 0 ;;
+    -h|--help)          sed -n '3,26p' "$0" | sed 's/^#\s\{0,1\}//'; exit 0 ;;
     -*)                 echo "Neznámý přepínač: $1" >&2; exit 2 ;;
     *)                  DEST="$1" ;;
   esac
@@ -161,6 +167,12 @@ esac
 # fallback na proměnné prostředí
 [[ -z "$WANT_UUID"  ]] && WANT_UUID="${DEST_UUID:-}"
 [[ -z "$WANT_LABEL" ]] && WANT_LABEL="${DEST_LABEL:-}"
+
+# Cíl zadaný výslovně (cesta / --uuid / --label / env) = chování jako ve skriptu/cronu,
+# otázky na režim se přeskočí. Cíl doplněný tiše ze zapamatovaného target.conf níže
+# tohle NEnastaví, takže se na režim pořád zeptáme (uživatel žádný záměr nesdělil).
+CLI_TARGET_GIVEN=0
+[[ -n "$DEST" || -n "$WANT_UUID" || -n "$WANT_LABEL" ]] && CLI_TARGET_GIVEN=1
 
 ask() {  # ask "otázka" "A|N"  -> návrat 0 pro ano; druhý arg = výchozí
   local q="$1" def="${2:-N}" ans hint
@@ -199,6 +211,32 @@ if [[ -z "$DEST" && -z "$WANT_UUID" && -z "$WANT_LABEL" && -r "$CFG_DIR/target.c
 fi
 
 banner
+
+# --------------------------------------------------------------------------
+# Správa zapamatovaného disku (--forget / --show-target) – bez mountování
+# --------------------------------------------------------------------------
+
+if (( FORGET_TARGET )); then
+  if [[ -r "$CFG_DIR/target.conf" ]]; then
+    rm -f "$CFG_DIR/target.conf"
+    ok "Zapamatovaný disk smazán ($CFG_DIR/target.conf)."
+  else
+    info "Žádný zapamatovaný disk nebyl nastavený – není co zapomenout."
+  fi
+  exit 0
+fi
+
+if (( SHOW_TARGET )); then
+  if [[ -n "$WANT_UUID" || -n "$WANT_LABEL" ]]; then
+    step "Zapamatovaný disk"
+    kv "UUID"   "${WANT_UUID:-—}"
+    kv "Štítek" "${WANT_LABEL:-—}"
+    kv "Soubor" "$CFG_DIR/target.conf"
+  else
+    info "Žádný zapamatovaný disk. Ulož ho příště přes --save (nebo --uuid/--label --save)."
+  fi
+  exit 0
+fi
 
 # --------------------------------------------------------------------------
 # Prerekvizity
@@ -541,15 +579,19 @@ if [[ -z "$DEST" && -z "$WANT_UUID" && -z "$WANT_LABEL" && -t 0 && $ASSUME_YES -
   else
     read -r -p "$(printf '%s' "${CY}?${R} Zadej cestu k připojenému SSD: ")" DEST </dev/tty || DEST=""
   fi
+fi
 
-  if (( ! WIPE )); then
-    step "Režim zálohy"
-    if [[ $MIRROR_SET -eq 0 ]]; then
-      if ask "Zrcadlit? (co smažeš doma, zmizí i na SSD)" "N"; then MIRROR=1; else MIRROR=0; fi
-    fi
-    if ask "Spustit nejdřív zkušební běh (nic nezapíše)?" "A"; then
-      DRY_RUN=1; RUN_REAL_AFTER=1
-    fi
+# Otázky na režim (zrcadlo / zkušební běh): ptáme se vždy, když běžíme
+# interaktivně bez --yes a uživatel cíl výslovně nezadal na příkazové řádce –
+# ať už disk vybral teď v průvodci výše, nebo se tiše doplnil ze zapamatovaného
+# target.conf. Explicitní --uuid/--label/cesta = "spusť to" bez dotazů.
+if (( ! WIPE )) && [[ -t 0 && $ASSUME_YES -eq 0 && $CLI_TARGET_GIVEN -eq 0 ]]; then
+  step "Režim zálohy"
+  if [[ $MIRROR_SET -eq 0 ]]; then
+    if ask "Zrcadlit? (co smažeš doma, zmizí i na SSD)" "N"; then MIRROR=1; else MIRROR=0; fi
+  fi
+  if ask "Spustit nejdřív zkušební běh (nic nezapíše)?" "A"; then
+    DRY_RUN=1; RUN_REAL_AFTER=1
   fi
 fi
 
