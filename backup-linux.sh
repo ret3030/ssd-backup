@@ -581,6 +581,16 @@ if [[ -z "$DEST" && -z "$WANT_UUID" && -z "$WANT_LABEL" && -t 0 && $ASSUME_YES -
   fi
 fi
 
+# Nabídka wipe disku: stejné pravidlo jako u otázek na režim níže – ptáme se,
+# jen když cíl nebyl zadaný explicitně na příkazové řádce (--wipe tam stačí
+# napsat rovnou a projde se bez dotazu).
+if (( ! WIPE )) && [[ -t 0 && $ASSUME_YES -eq 0 && $CLI_TARGET_GIVEN -eq 0 ]]; then
+  step "Wipe disku"
+  if ask "Než začneme: cílový disk rychle přemazat? (TRIM + nový oddíl – SMAŽE VŠECHNA DATA)" "N"; then
+    WIPE=1
+  fi
+fi
+
 # Otázky na režim (zrcadlo / zkušební běh): ptáme se vždy, když běžíme
 # interaktivně bez --yes a uživatel cíl výslovně nezadal na příkazové řádce –
 # ať už disk vybral teď v průvodci výše, nebo se tiše doplnil ze zapamatovaného
