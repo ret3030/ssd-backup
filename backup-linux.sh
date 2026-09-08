@@ -668,7 +668,7 @@ kv "Zdrojů"   "${#EXISTING[@]} složek"
 if (( CROSSFS )); then
   warn "Souborový systém cíle je ${FSTYPE} – počítá se s těmito omezeními:"
   info "• neukládá Unixová práva, vlastníky ani rozšířené atributy"
-  info "• symlinky se ukládají jako kopie svého cíle (--safe-links), ne jako odkazy"
+  info "• symlinky se neukládají (exFAT je neumí); rozbité odkazy se přeskočí"
   info "• nerozlišuje velká/malá písmena – soubory lišící se jen velikostí se přepíšou"
   info "• kvůli chybám „mkstemp\" na exFAT/FAT běží rsync v režimu --inplace"
   info "  Používáš disk jen s Linuxem? Spolehlivější je ext4 (viz README)."
@@ -706,13 +706,19 @@ run_backup() {
   log="$DEST/backup/backup-$(date +%Y%m%d-%H%M%S)-$HOSTDIR$sfx.log"
 
   if (( CROSSFS )); then
-    opts=( -rt -L --safe-links --no-perms --no-owner --no-group
+    # exFAT/FAT/NTFS neumí symlinky. --no-links je celé přeskočí (i rozbité –
+    # ty by s -L skončily chybou „symlink has no referent" a kódem 23).
+    opts=( -rt --no-links --no-perms --no-owner --no-group
            --modify-window=1 --inplace --partial )
   else
     opts=( -aAX )
   fi
-  opts+=( --human-readable --prune-empty-dirs )
-  if (( RSYNC_MAJOR >= 3 )); then opts+=( --info=progress2 ); else opts+=( --progress ); fi
+  opts+=( --human-readable --prune-empty-dirs --stats )
+  # živý progress (procenta, rychlost, ETA) jen do terminálu; do logu píše rsync
+  # sám přes --log-file, takže log zůstane čitelný a bez CR smetí.
+  if [[ -t 1 ]]; then
+    if (( RSYNC_MAJOR >= 3 )); then opts+=( --info=progress2 ); else opts+=( --progress ); fi
+  fi
   (( MIRROR )) && opts+=( --delete --delete-excluded )
   (( dry ))    && opts+=( --dry-run )
   for pat in "${EXCLUDES[@]}"; do opts+=( --exclude="$pat" ); done
@@ -735,8 +741,8 @@ run_backup() {
     printf '\n  %s%s[%d/%d]%s %s\n' "${CY}▸${R}" "$B" "$i" "$n" "$R" "$src"
     t="$SECONDS"
     set +e
-    rsync "${opts[@]}" "$src" "$destdir/" 2>&1 | tee -a "$log"
-    rc=${PIPESTATUS[0]}
+    rsync "${opts[@]}" --log-file="$log" "$src" "$destdir/"
+    rc=$?
     set -e
     dt=$(( SECONDS - t ))
     case "$rc" in
@@ -747,8 +753,11 @@ run_backup() {
     esac
   done
 
-  errlines="$(grep -c -E '^rsync: |^rsync error:' "$log" 2>/dev/null || true)"
+  errlines="$(grep -c -E 'rsync: |rsync error:' "$log" 2>/dev/null || true)"
   errlines="${errlines:-0}"
+  local xfiles
+  xfiles="$(awk -F': ' '/Number of regular files transferred:/{gsub(/[^0-9]/,"",$2); s+=$2} END{print s+0}' "$log" 2>/dev/null || true)"
+  [[ -n "$xfiles" && "$xfiles" != "0" ]] && info "přeneseno souborů: $xfiles"
 
   step "Zapisuji zbytek na disk (sync)…"
   t="$SECONDS"; sync; info "hotovo ($(( SECONDS - t ))s)"
@@ -765,7 +774,7 @@ run_backup() {
     printf '    - %s\n' "${failed[@]}" | tee -a "$log"
   fi
   (( errlines )) && printf '  %s\n' "Chybových řádků v logu: $errlines" | tee -a "$log"
-  printf '  %s\n' "Podrobnosti:  grep -nE '^rsync: |^rsync error:' \"$log\"" | tee -a "$log"
+  printf '  %s\n' "Podrobnosti:  grep -nE 'rsync: |rsync error:' \"$log\"" | tee -a "$log"
   if (( CROSSFS )); then
     printf '  %s\n' "Cíl je ${FSTYPE}. Pokud „mkstemp\" chyby přetrvávají a disk používáš jen s Linuxem," | tee -a "$log"
     printf '  %s\n' "nejspolehlivější je přeformátovat na ext4 (README → „exFAT / FAT / NTFS\")." | tee -a "$log"

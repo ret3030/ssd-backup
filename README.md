@@ -53,8 +53,9 @@ třeba řádkem `BACKUP` nebo `Dokumenty/BACKUP` v `excludes.txt`.
 
 Skript souborový systém cíle rozpozná a přizpůsobí se:
 
-- **neposílá** `-A`/`-X` (práva, ACL, xattr tam stejně nejdou), symlinky ukládá jako
-  kopie cíle (`-L --safe-links`);
+- **neposílá** `-A`/`-X` (práva, ACL, xattr tam stejně nejdou) a symlinky
+  přeskakuje (`--no-links` – exFAT je neumí a rozbité odkazy by rsync shodil
+  chybou `symlink has no referent` a kódem 23);
 - jede v režimu `--inplace`, což řeší časté chyby `rsync: mkstemp … failed:
   No such file or directory` na exFAT při zápisu tisíců souborů;
 - `--modify-window=1` kryje zaokrouhlování časů na FAT (jinak by se kopírovalo vše znovu).
