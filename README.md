@@ -1,21 +1,31 @@
 # SSD Backup
 
-Jednoduché skripty, které přes `rsync` / `robocopy` přetáhnou tvoje **osobní
-složky na připojený externí SSD**. Spouštět se dají opakovaně – kopíruje se jen
-to, co se změnilo. Cloudové složky (ownCloud, Nextcloud, iCloud, Dropbox…) se
-**nezálohují**.
+Jednoduché skripty, které přes [`restic`](https://restic.net) zálohují tvoje **osobní
+složky na připojený externí SSD** – verzovaně, deduplikovaně a šifrovaně. Spouštět se
+dají opakovaně: co je beze změny, se znovu nenahrává. Nic se přitom **nemaže** – i
+smazané/staré verze zůstávají v historii, dokud je sám neprořízneš (`--prune`).
+Cloudové složky (ownCloud, Nextcloud, iCloud, Dropbox…) se **nezálohují**.
 
 Každý skript má průvodce s barevným výstupem: spusť ho bez argumentů a provede tě
-krok za krokem – **zkontroluje prerekvizity** (rsync / robocopy, awk, lsblk…),
-najde připojené disky, zeptá se na režim a nabídne zkušební běh.
+krok za krokem – **zkontroluje prerekvizity** (restic, awk, lsblk…), najde připojené
+disky a nabídne zkušební běh.
 
 by [@ret3030](https://github.com/ret3030)
 
 | Systém | Skript | Nástroj |
 |--------|--------|---------|
-| Linux | `backup-linux.sh` | `rsync` |
-| macOS | `backup-macos.sh` | `rsync` |
-| Windows | `backup-windows.ps1` | `robocopy` |
+| Linux | `backup-linux.sh` | `restic` |
+| macOS | `backup-macos.sh` | `restic` |
+| Windows | `backup-windows.ps1` | `restic` |
+
+### Instalace resticu
+
+```bash
+sudo pacman -S restic      # Arch
+sudo apt install restic    # Debian/Ubuntu
+brew install restic        # macOS
+winget install restic.restic   # Windows
+```
 
 ## Linux
 
@@ -27,7 +37,8 @@ by [@ret3030](https://github.com/ret3030)
 ./backup-linux.sh --uuid 1234-ABCD --save # zapamatovat disk do ~/.config/ssd-backup/
 ./backup-linux.sh --yes                   # bez dotazů; použije zapamatovaný disk (cron)
 ./backup-linux.sh /mnt/ssd --dry-run      # nic nezapíše, jen ukáže
-./backup-linux.sh /mnt/ssd --no-mirror    # nemaže na SSD to, co jsi smazal doma
+./backup-linux.sh /mnt/ssd --snapshots    # vypsat historii záloh
+./backup-linux.sh /mnt/ssd --prune=10     # po záloze ponechat jen posledních 10 snapshotů
 ./backup-linux.sh --umount                # po dokončení disk odpojit (--poweroff = i uspat)
 ./backup-linux.sh --wipe                  # rychlý wipe SSD (TRIM) + nový oddíl + mkfs, pak záloha
 ```
@@ -41,27 +52,17 @@ chybou, aby cron nezálohoval naslepo).
 ### Vlastní zdroje / výjimky bez editace skriptu
 
 ```
-~/.config/ssd-backup/sources.txt    # jedna cesta na řádek (přidá se k SOURCES)
-~/.config/ssd-backup/excludes.txt   # jeden vzor na řádek (přidá se k EXCLUDES)
-~/.config/ssd-backup/target.conf    # UUID= / LABEL= zapamatovaného disku (píše --save)
+~/.config/ssd-backup/sources.txt      # jedna cesta na řádek (přidá se k SOURCES)
+~/.config/ssd-backup/excludes.txt     # jeden vzor na řádek (přidá se k EXCLUDES)
+~/.config/ssd-backup/target.conf      # UUID= / LABEL= zapamatovaného disku (píše --save)
+~/.config/ssd-backup/restic-password  # heslo repozitáře – vygeneruje se samo při 1. běhu
 ```
 
-`#` je komentář, `~/` se rozvine na domovskou složku. Zálohu uvnitř zálohy vyřadíš
-třeba řádkem `BACKUP` nebo `Dokumenty/BACKUP` v `excludes.txt`.
+`#` je komentář, `~/` se rozvine na domovskou složku.
 
-### exFAT / FAT / NTFS jako cíl
-
-Skript souborový systém cíle rozpozná a přizpůsobí se:
-
-- **neposílá** `-A`/`-X` (práva, ACL, xattr tam stejně nejdou) a symlinky
-  přeskakuje (`--no-links` – exFAT je neumí a rozbité odkazy by rsync shodil
-  chybou `symlink has no referent` a kódem 23);
-- jede v režimu `--inplace`, což řeší časté chyby `rsync: mkstemp … failed:
-  No such file or directory` na exFAT při zápisu tisíců souborů;
-- `--modify-window=1` kryje zaokrouhlování časů na FAT (jinak by se kopírovalo vše znovu).
-
-exFAT navíc **nerozlišuje velká/malá písmena**. Pokud disk používáš jen s Linuxem,
-spolehlivější je `ext4` – buď ručně, nebo rovnou `./backup-linux.sh --wipe`.
+**Heslo repozitáře je jediný klíč k datům – bez něj je záloha nenávratně ztracená.**
+Skript ho při prvním běhu sám vygeneruje a uloží do `restic-password` (čte ho jen
+majitel souboru). Udělej si jeho kopii i mimo tenhle počítač (heslenka, trezor…).
 
 ### `--wipe` (rychlý „chytrý" wipe SSD)
 
@@ -69,12 +70,13 @@ spolehlivější je `ext4` – buď ručně, nebo rovnou `./backup-linux.sh --wi
 `mkfs.ext4` (nebo `mkfs.exfat` přes `--wipe=exfat`) → volitelně hned záloha.
 Vyžaduje potvrzení (opíšeš štítek disku + „ano"), **nikdy neběží s `--yes`** a odmítne
 disk, který nese systémové oddíly nebo není výměnný. Potřebuje `blkdiscard`,
-`sgdisk`/`parted`, `mkfs.*` a práva roota (`sudo`).
+`sgdisk`/`parted`, `mkfs.*` a práva roota (`sudo`). Restic funguje na libovolném
+souborovém systému (exFAT/ext4/NTFS) stejně dobře – wipe je jen pro pohodlí/rychlost,
+ne kvůli omezením zálohy.
 
 ### Návratový kód
 
-`0` = vše přeneseno · `1` = část souborů se nepřenesla (skript to vypíše a ukáže,
-kde v logu hledat – žádné falešné „Hotovo bez chyb") · `2` = špatné použití.
+`0` = záloha proběhla · `1` = restic hlásil chybu · `2` = špatné použití.
 
 ## macOS
 
@@ -82,12 +84,10 @@ kde v logu hledat – žádné falešné „Hotovo bez chyb") · `2` = špatné 
 ./backup-macos.sh                         # průvodce
 ./backup-macos.sh /Volumes/MujSSD
 ./backup-macos.sh /Volumes/MujSSD --dry-run
-./backup-macos.sh /Volumes/MujSSD --no-mirror
+./backup-macos.sh /Volumes/MujSSD --yes
+./backup-macos.sh /Volumes/MujSSD --snapshots
+./backup-macos.sh /Volumes/MujSSD --prune=10
 ```
-
-Novější macOS má místo `rsync` jen systémový **openrsync** – záloha funguje, ale
-nepřenáší ACL, rozšířené atributy ani resource forky. Pro plnou zálohu:
-`brew install rsync` – skript si verzi 3.x automaticky vezme a přidá `-aAX`.
 
 ## Windows
 
@@ -95,8 +95,9 @@ nepřenáší ACL, rozšířené atributy ani resource forky. Pro plnou zálohu:
 .\backup-windows.ps1                       # průvodce
 .\backup-windows.ps1 -Dest E:\
 .\backup-windows.ps1 -Dest E:\ -DryRun
-.\backup-windows.ps1 -Dest E:\ -NoMirror
-.\backup-windows.ps1 -Dest E:\ -Yes       # bez dotazů (Plánovač úloh)
+.\backup-windows.ps1 -Dest E:\ -Yes        # bez dotazů (Plánovač úloh)
+.\backup-windows.ps1 -Dest E:\ -Snapshots
+.\backup-windows.ps1 -Dest E:\ -Prune 10
 ```
 
 Kdyby to blokovala execution policy:
@@ -108,9 +109,18 @@ powershell -ExecutionPolicy Bypass -File .\backup-windows.ps1
 ## Kam se data ukládají
 
 ```
-<SSD>/backup/<hostname>-<user>/…      # struktura kopíruje umístění vůči domovské složce
-<SSD>/backup/backup-<datum>-….log     # log každého běhu
+<SSD>/backup/<hostname>-<user>/restic-repo/    # restic repozitář (šifrovaný, binární)
 ```
+
+Obsah repozitáře se prohlíží a obnovuje přes restic, ne přímým procházením souborů:
+
+```bash
+restic -r <SSD>/backup/<hostname>-<user>/restic-repo snapshots           # historie
+restic -r <SSD>/backup/<hostname>-<user>/restic-repo restore latest --target /kam
+```
+
+(potřebuje `RESTIC_PASSWORD_FILE=~/.config/ssd-backup/restic-password`, případně na
+jiném počítači stejné heslo z tohoto souboru)
 
 ## Co se zálohuje / nezálohuje
 
@@ -121,18 +131,17 @@ powershell -ExecutionPolicy Bypass -File .\backup-windows.ps1
   `Dropbox`, `Google Drive`, cache, koš, `node_modules`, `__pycache__`, build
   složky… – viz `EXCLUDES` / `$ExcludeDirs`.
 
-Oba seznamy si nahoře ve skriptu uprav podle sebe – na Linuxu je navíc můžeš rozšířit
-přes `~/.config/ssd-backup/{sources,excludes}.txt` bez zásahu do skriptu.
+Oba seznamy si nahoře ve skriptu uprav podle sebe – na Linuxu/macOS je navíc můžeš
+rozšířit přes `~/.config/ssd-backup/{sources,excludes}.txt` bez zásahu do skriptu.
 
 ## Poznámky
 
-- Výchozí režim je **zrcadlo** (`--delete` / `/MIR`): co smažeš doma, zmizí i na
-  SSD. Nechceš to? Použij `--no-mirror` / `-NoMirror` (průvodce se ptá).
-- Maže se jen uvnitř `<SSD>/backup/<hostname>-<user>/`, a to vždy jen v rámci právě
-  kopírované zdrojové složky – nikde jinde na disku.
-- První běh může trvat dlouho, další jsou rychlé (přenáší se jen změny).
-- Na Linuxu se po zápisu volá `sync`; s `--umount` skript disk sám odpojí, takže
-  ho můžeš rovnou vytáhnout.
+- Restic **nikdy nic nemaže sám** – každý běh je nový snapshot, staré verze i
+  smazané soubory zůstávají v historii. Chceš uklidit místo? `--prune=N` po záloze
+  ponechá jen posledních `N` snapshotů (výchozí 10 při použití bez čísla).
+- Díky deduplikaci na úrovni bloků zabírají opakované zálohy na disku jen zlomek
+  původní velikosti, i když se soubory přejmenují nebo mírně změní.
+- První běh může trvat dlouho (čte se vše), další jsou rychlé (jen změny).
 
 ## Licence
 

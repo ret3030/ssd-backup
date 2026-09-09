@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 #
 #   SSD BACKUP  ·  by @ret3030
-#   Záloha osobních souborů na externí SSD (Linux). Nezávislá na počítači:
+#   Záloha osobních souborů na externí SSD (Linux) přes restic. Nezávislá na počítači:
 #   cíl se určuje podle UUID / štítku disku a když není připojený, skript ho připojí sám.
+#
+#   Restic ukládá verzované, deduplikované a šifrované snapshoty – žádné mazání ani
+#   přepisování při běžném běhu (na rozdíl od zrcadlení: co smažeš doma, na SSD
+#   zůstane v historii, dokud ji sám neprořízneš přes --prune).
 #
 # Použití:
 #   ./backup-linux.sh                          # PRŮVODCE – provede tě krok za krokem
@@ -13,17 +17,20 @@
 #   ./backup-linux.sh --yes                    # bez dotazů; použije zapamatovaný disk (cron)
 #   ./backup-linux.sh --show-target            # který disk je zapamatovaný
 #   ./backup-linux.sh --forget                 # zapamatovaný disk smazat
+#   ./backup-linux.sh --snapshots              # vypsat historii záloh (bez zálohování)
 #
 #   Další přepínače:
-#   --no-mirror       nemazat na SSD soubory smazané ve zdroji
-#   --dry-run         jen ukázat, co by se dělo
-#   --umount          po dokončení disk odpojit  (--poweroff = odpojit a uspat)
-#   --no-umount       nechat připojený i když ho připojil skript
+#   --dry-run           jen ukázat, co by se zálohovalo
+#   --umount             po dokončení disk odpojit  (--poweroff = odpojit a uspat)
+#   --no-umount           nechat připojený i když ho připojil skript
 #   --wipe[=ext4|exfat]  rychlý „chytrý" wipe SSD (TRIM) + nový oddíl + mkfs, pak záloha
+#   --prune[=N]           po záloze zahodit staré snapshoty, ponechat posledních N (výchozí 10)
 #
 # Zdroje:  pole SOURCES níže + ~/.config/ssd-backup/sources.txt  (cesta na řádek)
 # Výjimky: pole EXCLUDES níže + ~/.config/ssd-backup/excludes.txt
-# Návratový kód: 0 = vše přeneseno, 1 = část dat se nepřenesla (viz log), 2 = špatné použití.
+# Heslo repozitáře: ~/.config/ssd-backup/restic-password (při prvním běhu se vygeneruje samo –
+#   BEZ NĚJ SE K ZÁLOZE NEDOSTANEŠ, udělej si z něj i vlastní kopii mimo tenhle disk).
+# Návratový kód: 0 = záloha proběhla, 1 = restic hlásil chybu, 2 = špatné použití.
 
 set -euo pipefail
 
@@ -80,7 +87,9 @@ EXCLUDES=(
   "target"
   ".steam"
   "Steam"
-  # Tip: zálohu uvnitř zálohy vyřaď např. řádkem   BACKUP   nebo   Dokumenty/BACKUP
+  "BACKUP"
+  "restic-repo"
+  # Tip: zálohu uvnitř zálohy vyřaď třeba řádkem   Dokumenty/BACKUP
 )
 
 CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ssd-backup"
@@ -102,8 +111,8 @@ RULE="━━━━━━━━━━━━━━━━━━━━━━━━�
 banner() {
   printf '\n'
   printf '%s\n' "${CY}  ${RULE}${R}"
-  printf '%s\n' "${CY}${B}   ◆  SSD BACKUP${R}${CY}  ·  osobní soubory${R}"
-  printf '%s\n' "${GY}   záloha domácích dat na externí disk${R}"
+  printf '%s\n' "${CY}${B}   ◆  SSD BACKUP${R}${CY}  ·  osobní soubory (restic)${R}"
+  printf '%s\n' "${GY}   verzovaná, šifrovaná záloha domácích dat na externí disk${R}"
   printf '%s\n' "${MG}${B}   by @ret3030${R}"
   printf '%s\n' "${CY}  ${RULE}${R}"
   printf '\n'
@@ -122,40 +131,42 @@ kv()   { printf "  ${GY}%-9s${R} %s\n" "$1" "$2"; }
 DEST="${DEST:-}"
 WANT_UUID=""
 WANT_LABEL=""
-MIRROR=1
 DRY_RUN=0
 ASSUME_YES=0
-MIRROR_SET=0
 DO_UMOUNT=0
 UMOUNT_SET=0
 DO_POWEROFF=0
 SAVE_TARGET=0
 FORGET_TARGET=0
 SHOW_TARGET=0
+LIST_SNAPSHOTS=0
 WIPE=0
 WIPE_FS=""
+PRUNE=0
+PRUNE_KEEP=10
 
 while (($#)); do
   case "$1" in
-    --no-mirror)        MIRROR=0; MIRROR_SET=1 ;;
-    --mirror)           MIRROR=1; MIRROR_SET=1 ;;
-    --dry-run)          DRY_RUN=1 ;;
-    -y|--yes)           ASSUME_YES=1 ;;
-    --umount|--unmount) DO_UMOUNT=1; UMOUNT_SET=1 ;;
-    --no-umount)        DO_UMOUNT=0; UMOUNT_SET=1 ;;
-    --poweroff)         DO_UMOUNT=1; UMOUNT_SET=1; DO_POWEROFF=1 ;;
-    --save)             SAVE_TARGET=1 ;;
-    --forget)           FORGET_TARGET=1 ;;
-    --show-target)      SHOW_TARGET=1 ;;
-    --wipe|--format)    WIPE=1 ;;
-    --wipe=*|--format=*) WIPE=1; WIPE_FS="${1#*=}" ;;
-    --uuid)             shift || true; WANT_UUID="${1:-}" ;;
-    --uuid=*)           WANT_UUID="${1#*=}" ;;
-    --label)            shift || true; WANT_LABEL="${1:-}" ;;
-    --label=*)          WANT_LABEL="${1#*=}" ;;
-    -h|--help)          sed -n '3,26p' "$0" | sed 's/^#\s\{0,1\}//'; exit 0 ;;
-    -*)                 echo "Neznámý přepínač: $1" >&2; exit 2 ;;
-    *)                  DEST="$1" ;;
+    --dry-run)           DRY_RUN=1 ;;
+    -y|--yes)             ASSUME_YES=1 ;;
+    --umount|--unmount)  DO_UMOUNT=1; UMOUNT_SET=1 ;;
+    --no-umount)          DO_UMOUNT=0; UMOUNT_SET=1 ;;
+    --poweroff)           DO_UMOUNT=1; UMOUNT_SET=1; DO_POWEROFF=1 ;;
+    --save)               SAVE_TARGET=1 ;;
+    --forget)             FORGET_TARGET=1 ;;
+    --show-target)        SHOW_TARGET=1 ;;
+    --snapshots)           LIST_SNAPSHOTS=1 ;;
+    --wipe|--format)      WIPE=1 ;;
+    --wipe=*|--format=*)  WIPE=1; WIPE_FS="${1#*=}" ;;
+    --prune)               PRUNE=1 ;;
+    --prune=*)             PRUNE=1; PRUNE_KEEP="${1#*=}" ;;
+    --uuid)                shift || true; WANT_UUID="${1:-}" ;;
+    --uuid=*)              WANT_UUID="${1#*=}" ;;
+    --label)               shift || true; WANT_LABEL="${1:-}" ;;
+    --label=*)             WANT_LABEL="${1#*=}" ;;
+    -h|--help)            sed -n '3,29p' "$0" | sed 's/^#\s\{0,1\}//'; exit 0 ;;
+    -*)                    echo "Neznámý přepínač: $1" >&2; exit 2 ;;
+    *)                     DEST="$1" ;;
   esac
   shift || true
 done
@@ -164,13 +175,9 @@ case "${WIPE_FS,,}" in ""|ext4|exfat) WIPE_FS="${WIPE_FS,,}" ;;
   *) echo "Neznámý formát pro --wipe: $WIPE_FS (povoleno: ext4, exfat)" >&2; exit 2 ;;
 esac
 
-# fallback na proměnné prostředí
 [[ -z "$WANT_UUID"  ]] && WANT_UUID="${DEST_UUID:-}"
 [[ -z "$WANT_LABEL" ]] && WANT_LABEL="${DEST_LABEL:-}"
 
-# Cíl zadaný výslovně (cesta / --uuid / --label / env) = chování jako ve skriptu/cronu,
-# otázky na režim se přeskočí. Cíl doplněný tiše ze zapamatovaného target.conf níže
-# tohle NEnastaví, takže se na režim pořád zeptáme (uživatel žádný záměr nesdělil).
 CLI_TARGET_GIVEN=0
 [[ -n "$DEST" || -n "$WANT_UUID" || -n "$WANT_LABEL" ]] && CLI_TARGET_GIVEN=1
 
@@ -243,14 +250,12 @@ fi
 # --------------------------------------------------------------------------
 
 need() { command -v "$1" >/dev/null 2>&1; }
-RSYNC_MAJOR=0
 
 check_prereqs() {
   local miss=()
-  need rsync || miss+=( rsync )
-  need awk   || miss+=( awk )
-  need tee   || miss+=( coreutils )
-  need lsblk || miss+=( util-linux )
+  need restic || miss+=( restic )
+  need awk    || miss+=( awk )
+  need lsblk  || miss+=( util-linux )
   if (( ${#miss[@]} )); then
     err "Chybí nástroje: ${miss[*]}"
     if   need apt-get; then info "Nainstaluj: sudo apt install ${miss[*]}"
@@ -264,13 +269,25 @@ check_prereqs() {
   need udisksctl || warn "udisksctl nenalezen – připojení disku bude přes 'sudo mount'."
 
   local v
-  v="$(rsync --version 2>/dev/null | head -1 || true)"
-  RSYNC_MAJOR="$(printf '%s\n' "$v" | sed -n 's/.*version \([0-9]\+\).*/\1/p')"
-  RSYNC_MAJOR="${RSYNC_MAJOR:-0}"
-  v="$(printf '%s\n' "$v" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)"
-  ok "Prerekvizity v pořádku (rsync ${v:-?})."
+  v="$(restic version 2>/dev/null | awk '{print $2}')"
+  ok "Prerekvizity v pořádku (restic ${v:-?})."
 }
 check_prereqs
+
+# --------------------------------------------------------------------------
+# Heslo repozitáře – vygeneruje se samo při prvním běhu
+# --------------------------------------------------------------------------
+
+PASSFILE="$CFG_DIR/restic-password"
+
+ensure_password() {
+  [[ -s "$PASSFILE" ]] && return 0
+  mkdir -p "$CFG_DIR"
+  ( umask 077; head -c 32 /dev/urandom | base64 | tr -d '\n' > "$PASSFILE" )
+  chmod 600 "$PASSFILE"
+  warn "Vygenerováno nové heslo repozitáře: $PASSFILE"
+  warn "BEZ NĚJ SE K ZÁLOZE NEDOSTANEŠ. Udělej si jeho kopii i mimo tenhle počítač (heslenka apod.)."
+}
 
 # --------------------------------------------------------------------------
 # Identifikace a připojení cílového disku
@@ -282,10 +299,8 @@ WE_MOUNTED=0      # 1 = připojil ho tento skript
 MOUNT_VIA=""      # udisks | mount
 FSTYPE_HINT=""
 
-# Oddělovač polí ve výstupu lsblk_scan – US (0x1f), nevyskytuje se v datech ani ve whitespace.
 SEP=$'\x1f'
 
-# Projde bloková zařízení, jeden řádek = NAME|UUID|LABEL|MOUNTPOINT|FSTYPE|RM|HOTPLUG|SIZE  (odděleno $SEP)
 lsblk_scan() {
   local line NAME UUID LABEL MOUNTPOINT FSTYPE RM HOTPLUG SIZE TYPE
   while IFS= read -r line; do
@@ -298,7 +313,6 @@ lsblk_scan() {
   done < <(lsblk -Ppo NAME,UUID,LABEL,MOUNTPOINT,FSTYPE,RM,HOTPLUG,SIZE,TYPE 2>/dev/null || true)
 }
 
-# Najde /dev uzel podle WANT_UUID nebo WANT_LABEL. Naplní DEV, MP, FSTYPE_HINT.
 find_target_dev() {
   local n u l mp fs rest
   while IFS="$SEP" read -r n u l mp fs rest; do
@@ -334,7 +348,6 @@ mount_target_dev() {
     warn "udisksctl: $out"
   fi
 
-  # fallback přes mount (chce root)
   local sudo="" mp mopts=()
   [[ "$(id -u)" -ne 0 ]] && sudo="sudo"
   mp="/run/media/$(id -un)/${WANT_LABEL:-ssd-backup}"
@@ -406,11 +419,9 @@ do_wipe() {
   done
   need sgdisk || need parted || { err "Chybí sgdisk (gptfdisk) nebo parted."; exit 1; }
 
-  # celý disk nad oddílem
   disk="$(lsblk -no PKNAME "$part" 2>/dev/null | head -1)"
   [[ -n "$disk" ]] && disk="/dev/$disk" || disk="$part"
 
-  # bezpečnostní pojistky
   local rm hp
   rm="$(lsblk -dno RM "$disk" 2>/dev/null | head -1)"
   hp="$(lsblk -dno HOTPLUG "$disk" 2>/dev/null | head -1)"
@@ -445,7 +456,7 @@ do_wipe() {
 
   fs="$WIPE_FS"
   if [[ -z "$fs" ]]; then
-    if ask "Formát ext4? (doporučeno pro Linux; „n\" = exFAT pro sdílení s Windows/macOS)" "A"; then
+    if ask "Formát ext4? (doporučeno; „n\" = exFAT pro sdílení s Windows/macOS)" "A"; then
       fs=ext4
     else
       fs=exfat
@@ -533,7 +544,6 @@ trap cleanup EXIT INT TERM
 # Průvodce (interaktivně, když není zadaný žádný cíl)
 # --------------------------------------------------------------------------
 
-RUN_REAL_AFTER=0
 DEST_DEV_UUID=""
 DEST_DEV_LABEL=""
 
@@ -581,9 +591,6 @@ if [[ -z "$DEST" && -z "$WANT_UUID" && -z "$WANT_LABEL" && -t 0 && $ASSUME_YES -
   fi
 fi
 
-# Nabídka wipe disku: stejné pravidlo jako u otázek na režim níže – ptáme se,
-# jen když cíl nebyl zadaný explicitně na příkazové řádce (--wipe tam stačí
-# napsat rovnou a projde se bez dotazu).
 if (( ! WIPE )) && [[ -t 0 && $ASSUME_YES -eq 0 && $CLI_TARGET_GIVEN -eq 0 ]]; then
   step "Wipe disku"
   if ask "Než začneme: cílový disk rychle přemazat? (TRIM + nový oddíl – SMAŽE VŠECHNA DATA)" "N"; then
@@ -591,17 +598,10 @@ if (( ! WIPE )) && [[ -t 0 && $ASSUME_YES -eq 0 && $CLI_TARGET_GIVEN -eq 0 ]]; t
   fi
 fi
 
-# Otázky na režim (zrcadlo / zkušební běh): ptáme se vždy, když běžíme
-# interaktivně bez --yes a uživatel cíl výslovně nezadal na příkazové řádce –
-# ať už disk vybral teď v průvodci výše, nebo se tiše doplnil ze zapamatovaného
-# target.conf. Explicitní --uuid/--label/cesta = "spusť to" bez dotazů.
 if (( ! WIPE )) && [[ -t 0 && $ASSUME_YES -eq 0 && $CLI_TARGET_GIVEN -eq 0 ]]; then
-  step "Režim zálohy"
-  if [[ $MIRROR_SET -eq 0 ]]; then
-    if ask "Zrcadlit? (co smažeš doma, zmizí i na SSD)" "N"; then MIRROR=1; else MIRROR=0; fi
-  fi
+  step "Zkušební běh"
   if ask "Spustit nejdřív zkušební běh (nic nezapíše)?" "A"; then
-    DRY_RUN=1; RUN_REAL_AFTER=1
+    DRY_RUN=1
   fi
 fi
 
@@ -619,9 +619,8 @@ if (( WIPE )); then
     wipedev="$(findmnt -no SOURCE -T "$DEST" 2>/dev/null || true)"
   fi
   do_wipe "$wipedev"
-  DEV=""; MP=""; WE_MOUNTED=0     # čerstvý disk, znovu se identifikuje níž
+  DEV=""; MP=""; WE_MOUNTED=0
   ask "Spustit teď zálohu na čerstvý disk?" "A" || { info "Hotovo. Disk je naformátovaný."; exit 0; }
-  if [[ $MIRROR_SET -eq 0 ]] && ! ask "Zrcadlit? (co smažeš doma, zmizí i na SSD)" "N"; then MIRROR=0; fi
 fi
 
 # --------------------------------------------------------------------------
@@ -657,7 +656,6 @@ case "$(realpath "$DEST")" in
   "$HOME"|"/"|"") err "Podezřelý cíl '$DEST'. Zadej složku na externím disku."; exit 1 ;;
 esac
 
-# Souborový systém, zařízení a volné místo cíle
 FSTYPE=""; MNT_SRC=""; MNT_POINT=""
 if need findmnt; then
   FSTYPE="$(findmnt -T "$DEST" -no FSTYPE 2>/dev/null || true)"
@@ -669,15 +667,8 @@ if [[ "$FSTYPE" == "fuseblk" && -n "$MNT_SRC" ]]; then
 fi
 [[ -z "$FSTYPE" ]] && FSTYPE="$(stat -f -c %T "$DEST" 2>/dev/null || true)"
 
-case "${FSTYPE,,}" in
-  exfat|vfat|msdos|fat|fat32|ntfs|ntfs3|hfs|hfsplus|fuseblk) CROSSFS=1 ;;
-  *) CROSSFS=0 ;;
-esac
-
 FREE_H="$(df -Ph "$DEST" 2>/dev/null | awk 'NR==2{print $4}' || true)"; FREE_H="${FREE_H:-?}"
 
-# Je cíl opravdu samostatně připojený (externí) disk, nebo jen složka na systémovém
-# disku / v ramdisku, protože SSD není připojený?
 ROOT_DEV="$(stat -c %d / 2>/dev/null || echo 0)"
 DEST_DEV="$(stat -c %d "$DEST" 2>/dev/null || echo 1)"
 SUSPECT=""
@@ -699,8 +690,8 @@ if [[ -n "$SUSPECT" ]]; then
 fi
 
 HOSTDIR="$(hostname)-$(whoami)"
-TARGET="$DEST/backup/$HOSTDIR"
-mkdir -p "$TARGET"
+REPO="$DEST/backup/$HOSTDIR/restic-repo"
+mkdir -p "$(dirname "$REPO")"
 
 EXISTING=()
 for src in "${SOURCES[@]}"; do
@@ -711,20 +702,29 @@ if [[ ${#EXISTING[@]} -eq 0 ]]; then
   exit 1
 fi
 
-step "Cíl zálohy"
-kv "Cesta"    "$TARGET"
-kv "Zařízení" "${MNT_SRC:-?}${DEST_DEV_UUID:+   UUID=$DEST_DEV_UUID}"
-kv "Systém"   "${FSTYPE:-?}"
-kv "Volno"    "$FREE_H"
-kv "Zdrojů"   "${#EXISTING[@]} složek"
+ensure_password
+export RESTIC_REPOSITORY="$REPO"
+export RESTIC_PASSWORD_FILE="$PASSFILE"
 
-if (( CROSSFS )); then
-  warn "Souborový systém cíle je ${FSTYPE} – počítá se s těmito omezeními:"
-  info "• neukládá Unixová práva, vlastníky ani rozšířené atributy"
-  info "• symlinky se neukládají (exFAT je neumí); rozbité odkazy se přeskočí"
-  info "• nerozlišuje velká/malá písmena – soubory lišící se jen velikostí se přepíšou"
-  info "• kvůli chybám „mkstemp\" na exFAT/FAT běží rsync v režimu --inplace"
-  info "  Používáš disk jen s Linuxem? Spolehlivější je ext4 (viz README)."
+step "Cíl zálohy"
+kv "Repozitář" "$REPO"
+kv "Zařízení"  "${MNT_SRC:-?}${DEST_DEV_UUID:+   UUID=$DEST_DEV_UUID}"
+kv "Systém"    "${FSTYPE:-?}"
+kv "Volno"     "$FREE_H"
+kv "Zdrojů"    "${#EXISTING[@]} složek"
+
+# Založit repozitář, pokud ještě neexistuje
+if [[ ! -f "$REPO/config" ]]; then
+  step "Zakládám nový restic repozitář…"
+  mkdir -p "$REPO"
+  restic init >/dev/null
+  ok "Repozitář založen."
+fi
+
+if (( LIST_SNAPSHOTS )); then
+  step "Historie záloh"
+  restic snapshots
+  exit 0
 fi
 
 # Zapamatovat disk?
@@ -748,128 +748,51 @@ if (( WE_MOUNTED )) && ! (( UMOUNT_SET )); then
 fi
 
 # --------------------------------------------------------------------------
-# Jeden průchod rsyncem.  $1 = 1 pro zkušební běh.  Návrat 1 = byly chyby.
+# Záloha přes restic
 # --------------------------------------------------------------------------
 
 run_backup() {
-  local dry="$1" log opts=() sfx=""
-  local -a failed=()
-  local n="${#EXISTING[@]}" i=0 rc=0 errlines=0 t dt t_all
-  (( dry )) && sfx="-dryrun"
-  log="$DEST/backup/backup-$(date +%Y%m%d-%H%M%S)-$HOSTDIR$sfx.log"
+  local dry="$1" opts=() rc=0
 
-  if (( CROSSFS )); then
-    # exFAT/FAT/NTFS neumí symlinky. --no-links je celé přeskočí (i rozbité –
-    # ty by s -L skončily chybou „symlink has no referent" a kódem 23).
-    opts=( -rt --no-links --no-perms --no-owner --no-group
-           --modify-window=1 --inplace --partial )
-  else
-    opts=( -aAX )
-  fi
-  opts+=( --human-readable --prune-empty-dirs --stats )
-  # živý progress (procenta, rychlost, ETA) jen do terminálu; do logu píše rsync
-  # sám přes --log-file, takže log zůstane čitelný a bez CR smetí.
-  if [[ -t 1 ]]; then
-    if (( RSYNC_MAJOR >= 3 )); then opts+=( --info=progress2 ); else opts+=( --progress ); fi
-  fi
-  (( MIRROR )) && opts+=( --delete --delete-excluded )
-  (( dry ))    && opts+=( --dry-run )
+  opts=( backup "${EXISTING[@]}" --tag ssd-backup )
   for pat in "${EXCLUDES[@]}"; do opts+=( --exclude="$pat" ); done
+  (( dry )) && opts+=( --dry-run --verbose )
+  [[ -t 1 ]] && opts+=( --verbose )
 
   local hdr="Záloha"
   (( dry )) && hdr="Záloha  ${YL}(ZKUŠEBNÍ BĚH – nic se nezapíše)${R}"
   step "$hdr"
-  kv "Režim" "$([[ $MIRROR -eq 1 ]] && echo 'zrcadlo (maže i na SSD)' || echo 'jen přidává')"
-  kv "Log"   "$log"
 
-  t_all="$SECONDS"
-  for src in "${EXISTING[@]}"; do
-    i=$((i+1))
-    local rel destdir
-    rel="${src#"$HOME"/}"
-    [[ "$rel" == "$src" ]] && rel="$(basename "$src")"
-    destdir="$TARGET/$(dirname "$rel")"
-    (( dry )) || mkdir -p "$destdir"
-
-    printf '\n  %s%s[%d/%d]%s %s\n' "${CY}▸${R}" "$B" "$i" "$n" "$R" "$src"
-    t="$SECONDS"
-    local try=1 max_try=1
-    # exFAT/FAT: kernel driver umí zpozdit zápis metadat nového adresáře,
-    # takže rsync na něj chvíli po vytvoření nedostane "open" (ENOENT) – při
-    # dalším průchodu už adresář existuje a soubor projde. Zkusíme to samé
-    # znovu, než to nahlásíme jako chybu.
-    (( CROSSFS )) && max_try=3
-    while :; do
-      set +e
-      rsync "${opts[@]}" --log-file="$log" "$src" "$destdir/"
-      rc=$?
-      set -e
-      if [[ "$rc" == 0 || "$rc" == 24 ]]; then break; fi
-      if (( CROSSFS )) && [[ "$rc" == 23 ]] && (( try < max_try )); then
-        warn "rc=23 (exFAT – adresář ještě \"nedopsaný\") – zkouším znovu [$((try+1))/$max_try]…"
-        sync; sleep 1
-        ((try++))
-        continue
-      fi
-      break
-    done
-    dt=$(( SECONDS - t ))
-    case "$rc" in
-      0)  info "hotovo za ${dt}s" ;;
-      24) warn "rc=24 – část souborů zmizela během kopírování (neškodné), ${dt}s" ;;
-      *)  err "rsync skončil s kódem $rc (${dt}s) – detaily v logu"
-          failed+=( "$(basename "$src")  (rc=$rc)" ) ;;
-    esac
-  done
-
-  errlines="$(grep -c -E 'rsync: |rsync error:' "$log" 2>/dev/null || true)"
-  errlines="${errlines:-0}"
-  local xfiles
-  xfiles="$(awk -F': ' '/Number of regular files transferred:/{gsub(/[^0-9]/,"",$2); s+=$2} END{print s+0}' "$log" 2>/dev/null || true)"
-  [[ -n "$xfiles" && "$xfiles" != "0" ]] && info "přeneseno souborů: $xfiles"
-
-  step "Zapisuji zbytek na disk (sync)…"
-  t="$SECONDS"; sync; info "hotovo ($(( SECONDS - t ))s)"
+  set +e
+  restic "${opts[@]}"
+  rc=$?
+  set -e
 
   echo
-  if (( ${#failed[@]} == 0 && errlines == 0 )); then
-    ok "Hotovo bez chyb za $(( (SECONDS - t_all) / 60 ))m $(( (SECONDS - t_all) % 60 ))s.  $(date '+%Y-%m-%d %H:%M:%S')" \
-      | tee -a "$log"
-    return 0
+  if (( rc == 0 )); then
+    ok "Hotovo bez chyb.  $(date '+%Y-%m-%d %H:%M:%S')"
+  else
+    err "restic skončil s kódem $rc."
   fi
-  err "DOKONČENO S CHYBAMI – část dat se NEPŘENESLA." | tee -a "$log" >&2
-  if (( ${#failed[@]} )); then
-    printf '  %s\n' "Zdroje s chybou:" | tee -a "$log"
-    printf '    - %s\n' "${failed[@]}" | tee -a "$log"
-  fi
-  (( errlines )) && printf '  %s\n' "Chybových řádků v logu: $errlines" | tee -a "$log"
-  printf '  %s\n' "Podrobnosti:  grep -nE 'rsync: |rsync error:' \"$log\"" | tee -a "$log"
-  if (( CROSSFS )); then
-    printf '  %s\n' "Cíl je ${FSTYPE}. Pokud „mkstemp\" chyby přetrvávají a disk používáš jen s Linuxem," | tee -a "$log"
-    printf '  %s\n' "nejspolehlivější je přeformátovat na ext4 (README → „exFAT / FAT / NTFS\")." | tee -a "$log"
-  fi
-  return 1
+  return "$rc"
 }
-
-# --------------------------------------------------------------------------
-# Běh
-# --------------------------------------------------------------------------
 
 if (( DRY_RUN )); then
   run_backup 1 || true
-  if (( RUN_REAL_AFTER )); then
+  if [[ -t 0 && $ASSUME_YES -eq 0 ]] && ask "Pokračovat teď doopravdy?" "A"; then
     echo
-    if ask "Pokračovat teď doopravdy?" "A"; then
-      echo
-    else
-      info "Ukončeno. Nic se nezapsalo."
-      exit 0
-    fi
   else
+    info "Ukončeno. Nic se nezapsalo."
     exit 0
   fi
 fi
 
 rc=0
 run_backup 0 || rc=$?
+
+if (( rc == 0 && PRUNE )); then
+  step "Prořezávám staré snapshoty (ponechám posledních $PRUNE_KEEP)…"
+  restic forget --keep-last "$PRUNE_KEEP" --prune || warn "forget --prune selhalo, snapshoty zůstaly beze změny."
+fi
+
 exit "$rc"

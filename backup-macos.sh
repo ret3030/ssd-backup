@@ -1,20 +1,27 @@
 #!/usr/bin/env bash
 #
 #   SSD BACKUP  ·  by @ret3030
-#   Jednoduchá záloha osobních souborů na externí SSD (macOS).
+#   Záloha osobních souborů na externí SSD (macOS) přes restic.
+#
+#   Restic ukládá verzované, deduplikované a šifrované snapshoty – žádné mazání ani
+#   přepisování při běžném běhu. Historie zůstává, dokud ji sám neprořízneš (--prune).
 #
 # Použití:
 #   ./backup-macos.sh                          # PRŮVODCE – provede tě krok za krokem
 #   ./backup-macos.sh /Volumes/MujSSD
 #   DEST=/Volumes/MujSSD ./backup-macos.sh
-#   ./backup-macos.sh /Volumes/MujSSD --no-mirror   # nemazat na SSD smazané soubory
-#   ./backup-macos.sh /Volumes/MujSSD --dry-run     # jen ukázat, co by se dělo
+#   ./backup-macos.sh /Volumes/MujSSD --dry-run     # jen ukázat, co by se zálohovalo
 #   ./backup-macos.sh /Volumes/MujSSD --yes         # přeskočit dotazy (launchd/cron)
+#   ./backup-macos.sh /Volumes/MujSSD --snapshots   # vypsat historii záloh
+#   ./backup-macos.sh /Volumes/MujSSD --prune=10    # po záloze ponechat jen posledních 10 snapshotů
 #
 # Co se zálohuje: složky v poli SOURCES níže (výchozí = běžné osobní složky v $HOME).
 # Co se NEzálohuje: viz EXCLUDES – iCloud Drive, ownCloud, Nextcloud, Dropbox, cache, koš, ~/Library.
 #
-# Tip: pro rychlejší a úplnější zálohu (ACL, progress) doporučuju `brew install rsync`.
+# Heslo repozitáře: ~/.config/ssd-backup/restic-password (při prvním běhu se vygeneruje samo –
+#   BEZ NĚJ SE K ZÁLOZE NEDOSTANEŠ, udělej si z něj i vlastní kopii mimo tenhle disk).
+#
+# Instalace resticu: brew install restic
 
 set -euo pipefail
 
@@ -39,7 +46,6 @@ SOURCES=(
   "$HOME/.config"
 )
 
-# Názvy/vzory, které se NIKDY nezálohují. Platí kdekoli ve stromu.
 EXCLUDES=(
   "com~apple~CloudDocs"          # iCloud Drive
   "Library/Mobile Documents"    # iCloud kontejnery
@@ -66,7 +72,11 @@ EXCLUDES=(
   ".gradle"
   ".m2/repository"
   "target"
+  "restic-repo"
 )
+
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ssd-backup"
+PASSFILE="$CFG_DIR/restic-password"
 
 # --------------------------------------------------------------------------
 # Vzhled
@@ -85,8 +95,8 @@ RULE="━━━━━━━━━━━━━━━━━━━━━━━━�
 banner() {
   printf '\n'
   printf '%s\n' "${CY}  ${RULE}${R}"
-  printf '%s\n' "${CY}${B}   ◆  SSD BACKUP${R}${CY}  ·  osobní soubory${R}"
-  printf '%s\n' "${GY}   záloha domácích dat na externí disk${R}"
+  printf '%s\n' "${CY}${B}   ◆  SSD BACKUP${R}${CY}  ·  osobní soubory (restic)${R}"
+  printf '%s\n' "${GY}   verzovaná, šifrovaná záloha domácích dat na externí disk${R}"
   printf '%s\n' "${MG}${B}   by @ret3030${R}"
   printf '%s\n' "${CY}  ${RULE}${R}"
   printf '\n'
@@ -96,27 +106,29 @@ info() { printf '  %s\n'  "${GY}$*${R}"; }
 ok()   { printf '%s\n'    "${GN}${B}✓${R} $*"; }
 warn() { printf '%s\n'    "${YL}${B}!${R} $*"; }
 err()  { printf '%s\n'    "${RD}${B}✗${R} $*" >&2; }
-kv()   { printf "  ${GY}%-8s${R} %s\n" "$1" "$2"; }
+kv()   { printf "  ${GY}%-9s${R} %s\n" "$1" "$2"; }
 
 # --------------------------------------------------------------------------
 # Argumenty
 # --------------------------------------------------------------------------
 
 DEST="${DEST:-}"
-MIRROR=1
 DRY_RUN=0
 ASSUME_YES=0
-MIRROR_SET=0
+LIST_SNAPSHOTS=0
+PRUNE=0
+PRUNE_KEEP=10
 
 for arg in "$@"; do
   case "$arg" in
-    --no-mirror) MIRROR=0; MIRROR_SET=1 ;;
-    --mirror)    MIRROR=1; MIRROR_SET=1 ;;
-    --dry-run)   DRY_RUN=1 ;;
-    -y|--yes)    ASSUME_YES=1 ;;
-    -h|--help)   sed -n '2,18p' "$0"; exit 0 ;;
-    -*)          echo "Neznámý přepínač: $arg" >&2; exit 2 ;;
-    *)           DEST="$arg" ;;
+    --dry-run)     DRY_RUN=1 ;;
+    -y|--yes)      ASSUME_YES=1 ;;
+    --snapshots)   LIST_SNAPSHOTS=1 ;;
+    --prune)       PRUNE=1 ;;
+    --prune=*)     PRUNE=1; PRUNE_KEEP="${arg#*=}" ;;
+    -h|--help)     sed -n '2,22p' "$0"; exit 0 ;;
+    -*)            echo "Neznámý přepínač: $arg" >&2; exit 2 ;;
+    *)             DEST="$arg" ;;
   esac
 done
 
@@ -137,40 +149,29 @@ banner
 
 need() { command -v "$1" >/dev/null 2>&1; }
 
-RSYNC_KIND="old"     # modern | openrsync | old
-
 check_prereqs() {
   local miss=()
-  need rsync || miss+=( rsync )
-  need df    || miss+=( df )
-  need stat  || miss+=( stat )
+  need restic || miss+=( restic )
+  need df     || miss+=( df )
+  need stat   || miss+=( stat )
   if (( ${#miss[@]} )); then
     err "Chybí nástroje: ${miss[*]}"
-    need rsync || info "Nainstaluj rsync: brew install rsync   (nebo Xcode Command Line Tools: xcode-select --install)"
+    need restic || info "Nainstaluj restic: brew install restic"
     exit 1
   fi
-
-  local rv v
-  rv="$(rsync --version 2>&1 || true)"
-  v="$(printf '%s\n' "$rv" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)"
-  if [[ "$rv" == *openrsync* ]]; then
-    RSYNC_KIND="openrsync"
-  elif [[ "$rv" =~ version\ ([0-9]+)\. ]] && (( ${BASH_REMATCH[1]:-0} >= 3 )); then
-    RSYNC_KIND="modern"
-  fi
-
-  case "$RSYNC_KIND" in
-    modern)
-      ok "Prerekvizity v pořádku (rsync ${v}, plná záloha vč. ACL/xattr)." ;;
-    openrsync)
-      warn "Používáš systémový openrsync – záloha funguje, ale nepřenáší ACL, rozšířené atributy ani resource forky."
-      info "Pro plnou zálohu: brew install rsync (skript ho pak použije automaticky)." ;;
-    *)
-      warn "Starý rsync ${v:-?} – funguje omezeně. Doporučeno: brew install rsync." ;;
-  esac
+  local v; v="$(restic version 2>/dev/null | awk '{print $2}')"
+  ok "Prerekvizity v pořádku (restic ${v:-?})."
 }
-
 check_prereqs
+
+ensure_password() {
+  [[ -s "$PASSFILE" ]] && return 0
+  mkdir -p "$CFG_DIR"
+  ( umask 077; head -c 32 /dev/urandom | base64 | tr -d '\n' > "$PASSFILE" )
+  chmod 600 "$PASSFILE"
+  warn "Vygenerováno nové heslo repozitáře: $PASSFILE"
+  warn "BEZ NĚJ SE K ZÁLOZE NEDOSTANEŠ. Udělej si jeho kopii i mimo tenhle počítač."
+}
 
 # --------------------------------------------------------------------------
 # Průvodce
@@ -184,7 +185,7 @@ if [[ -z "$DEST" && -t 0 && $ASSUME_YES -eq 0 ]]; then
   CANDS=()
   for v in /Volumes/*; do
     [[ -d "$v" ]] || continue
-    [[ "$(stat -f '%d' "$v" 2>/dev/null || echo y)" == "$ROOT_DEV" ]] && continue   # přeskoč systémový disk
+    [[ "$(stat -f '%d' "$v" 2>/dev/null || echo y)" == "$ROOT_DEV" ]] && continue
     size="$(df -h "$v" 2>/dev/null | awk 'NR==2{print $4" volno / "$2}')"
     CANDS+=( "$v"$'\t'"$size" )
   done
@@ -209,14 +210,9 @@ if [[ -z "$DEST" && -t 0 && $ASSUME_YES -eq 0 ]]; then
     read -r -p "$(printf '%s' "${CY}?${R} Zadej cestu k připojenému SSD: ")" DEST </dev/tty || DEST=""
   fi
 
-  step "Režim zálohy"
-  if [[ $MIRROR_SET -eq 0 ]]; then
-    if ask "Zrcadlit? (co smažeš doma, zmizí i na SSD)" "N"; then MIRROR=1; else MIRROR=0; fi
-  fi
-
+  step "Zkušební běh"
   if ask "Spustit nejdřív zkušební běh (nic nezapíše)?" "A"; then
     DRY_RUN=1
-    RUN_REAL_AFTER=1
   fi
 fi
 
@@ -237,8 +233,8 @@ case "$(cd "$DEST" && pwd -P)" in
 esac
 
 HOSTDIR="$(scutil --get LocalHostName 2>/dev/null || hostname -s)-$(whoami)"
-TARGET="$DEST/backup/$HOSTDIR"
-mkdir -p "$TARGET"
+REPO="$DEST/backup/$HOSTDIR/restic-repo"
+mkdir -p "$(dirname "$REPO")"
 
 EXISTING=()
 for src in "${SOURCES[@]}"; do
@@ -249,69 +245,72 @@ if [[ ${#EXISTING[@]} -eq 0 ]]; then
   exit 1
 fi
 
+ensure_password
+export RESTIC_REPOSITORY="$REPO"
+export RESTIC_PASSWORD_FILE="$PASSFILE"
+
+step "Cíl zálohy"
+kv "Repozitář" "$REPO"
+kv "Zdrojů"    "${#EXISTING[@]} složek"
+
+if [[ ! -f "$REPO/config" ]]; then
+  step "Zakládám nový restic repozitář…"
+  mkdir -p "$REPO"
+  restic init >/dev/null
+  ok "Repozitář založen."
+fi
+
+if (( LIST_SNAPSHOTS )); then
+  step "Historie záloh"
+  restic snapshots
+  exit 0
+fi
+
 # --------------------------------------------------------------------------
-# Jeden průchod rsyncem.  $1 = 1 pro zkušební běh
+# Záloha přes restic
 # --------------------------------------------------------------------------
 
 run_backup() {
-  local dry="$1" rc=0 log opts=() sfx=""
-  (( dry )) && sfx="-dryrun"
-  log="$DEST/backup/backup-$(date +%Y%m%d-%H%M%S)-$HOSTDIR$sfx.log"
-
-  if [[ "$RSYNC_KIND" == "modern" ]]; then
-    # Homebrew rsync 3.x – plná záloha
-    opts=( -aAX -E --human-readable --prune-empty-dirs --info=progress2 )
-    (( MIRROR )) && opts+=( --delete --delete-excluded )
-  else
-    # systémový openrsync / starý rsync – jen bezpečné, široce podporované volby
-    opts=( -a --progress )
-    (( MIRROR )) && opts+=( --delete )
-  fi
-  (( dry )) && opts+=( --dry-run )
+  local dry="$1" opts=() rc=0
+  opts=( backup "${EXISTING[@]}" --tag ssd-backup )
   for pat in "${EXCLUDES[@]}"; do opts+=( --exclude="$pat" ); done
+  (( dry )) && opts+=( --dry-run --verbose )
+  [[ -t 1 ]] && opts+=( --verbose )
 
   local hdr="Záloha"
   (( dry )) && hdr="Záloha  ${YL}(ZKUŠEBNÍ BĚH – nic se nezapíše)${R}"
   step "$hdr"
-  kv "Zdrojů"  "${#EXISTING[@]} složek"
-  kv "Cíl"     "$TARGET"
-  kv "Režim"   "$([[ $MIRROR -eq 1 ]] && echo 'zrcadlo (maže i na SSD)' || echo 'jen přidává')"
-  kv "Log"     "$log"
-  echo
 
-  for src in "${EXISTING[@]}"; do
-    local rel destdir
-    rel="${src#"$HOME"/}"
-    [[ "$rel" == "$src" ]] && rel="$(basename "$src")"
-    destdir="$TARGET/$(dirname "$rel")"
-    (( dry )) || mkdir -p "$destdir"
-    printf '  %s %s\n' "${CY}▸${R}" "$src"
-    rsync "${opts[@]}" "$src" "$destdir/" 2>&1 | tee -a "$log" || rc=$?
-  done
+  set +e
+  restic "${opts[@]}"
+  rc=$?
+  set -e
 
   echo
-  if [[ $rc -eq 0 ]]; then
-    ok "Hotovo bez chyb.  $(date '+%H:%M:%S')" | tee -a "$log"
+  if (( rc == 0 )); then
+    ok "Hotovo bez chyb.  $(date '+%H:%M:%S')"
   else
-    warn "Dokončeno, ale rsync hlásil chyby (kód $rc). Zkontroluj log: $log" | tee -a "$log"
+    err "restic skončil s kódem $rc."
   fi
-  return $rc
+  return "$rc"
 }
 
 if (( DRY_RUN )); then
   run_backup 1 || true
-  if [[ "${RUN_REAL_AFTER:-0}" -eq 1 ]]; then
+  if [[ -t 0 && $ASSUME_YES -eq 0 ]] && ask "Pokračovat teď doopravdy?" "A"; then
     echo
-    if ask "Pokračovat teď doopravdy?" "A"; then
-      echo
-    else
-      info "Ukončeno. Nic se nezapsalo."
-      exit 0
-    fi
   else
+    info "Ukončeno. Nic se nezapsalo."
     exit 0
   fi
 fi
 
-run_backup 0
-exit $?
+rc=0
+run_backup 0 || rc=$?
+
+if (( rc == 0 && PRUNE )); then
+  step "Prořezávám staré snapshoty (ponechám posledních $PRUNE_KEEP)…"
+  restic forget --keep-last "$PRUNE_KEEP" --prune || warn "forget --prune selhalo, snapshoty zůstaly beze změny."
+fi
+
+exit "$rc"

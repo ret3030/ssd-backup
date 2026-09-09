@@ -1,31 +1,41 @@
 <#
-    Jednoduchá záloha osobních souborů na externí SSD (Windows).
+    Zaloha osobnich souboru na externi SSD (Windows) pres restic.
 
-    Použití (PowerShell):
-        .\backup-windows.ps1                          # PRŮVODCE – provede tě krok za krokem
+    Restic uklada verzovane, deduplikovane a sifrovane snapshoty - zadne mazani ani
+    prepisovani pri beznem behu. Historie zustava, dokud ji sam neproriznes (-Prune).
+
+    Pouziti (PowerShell):
+        .\backup-windows.ps1                          # PRUVODCE - provede te krok za krokem
         .\backup-windows.ps1 -Dest E:\
-        .\backup-windows.ps1 -Dest E:\ -NoMirror      # nemazat na SSD soubory smazané ve zdroji
-        .\backup-windows.ps1 -Dest E:\ -DryRun        # jen ukázat, co by se dělo
-        .\backup-windows.ps1 -Dest E:\ -Yes           # přeskočit dotazy (pro Plánovač úloh apod.)
+        .\backup-windows.ps1 -Dest E:\ -DryRun        # jen ukazat, co by se zalohovalo
+        .\backup-windows.ps1 -Dest E:\ -Yes           # preskocit dotazy (Planovac uloh)
+        .\backup-windows.ps1 -Dest E:\ -Snapshots     # vypsat historii zaloh
+        .\backup-windows.ps1 -Dest E:\ -Prune 10      # po zaloze ponechat jen poslednich 10 snapshotu
 
-    Pokud skript nejde spustit kvůli politice, spusť jednorázově:
+    Pokud skript nejde spustit kvuli politice, spust jednorazove:
         powershell -ExecutionPolicy Bypass -File .\backup-windows.ps1
 
-    Co se zálohuje: složky v $Sources níže (výchozí = běžné osobní složky profilu).
-    Co se NEzálohuje: názvy složek v $ExcludeDirs (ownCloud, Nextcloud, OneDrive, Dropbox, cache, ...).
+    Co se zalohuje: slozky v $Sources nize (vychozi = bezne osobni slozky profilu).
+    Co se NEzalohuje: nazvy slozek v $ExcludeDirs (ownCloud, Nextcloud, OneDrive, Dropbox, cache, ...).
+
+    Heslo repozitare: %APPDATA%\ssd-backup\restic-password (pri prvnim behu se vygeneruje samo -
+    BEZ NEJ SE K ZALOZE NEDOSTANES, udelej si z nej i vlastni kopii mimo tenhle disk).
+
+    Instalace resticu:  winget install restic.restic   (nebo choco/scoop, viz restic.net)
 #>
 
 param(
     [string]$Dest,
-    [switch]$NoMirror,
     [switch]$DryRun,
-    [switch]$Yes
+    [switch]$Yes,
+    [switch]$Snapshots,
+    [int]$Prune = 0
 )
 
 $ErrorActionPreference = 'Stop'
 
 # --------------------------------------------------------------------------
-# Nastavení – klidně si uprav
+# Nastaveni - klidne si uprav
 # --------------------------------------------------------------------------
 
 $Sources = @(
@@ -39,7 +49,7 @@ $Sources = @(
     "$env:USERPROFILE\Projects"
 )
 
-# Názvy složek, které se nikdy nezálohují (kdekoli ve stromu).
+# Nazvy slozek, ktere se nikdy nezalohuji (kdekoli ve stromu).
 $ExcludeDirs = @(
     "owncloud", "ownCloud", "OwnCloud"
     "Nextcloud", "nextcloud"
@@ -50,15 +60,19 @@ $ExcludeDirs = @(
     "node_modules", "__pycache__", ".venv", "venv"
     ".gradle", "target", "bin", "obj"
     '$Recycle.Bin', 'System Volume Information'
+    "restic-repo"
 )
 
-# Vzory souborů, které se nezálohují.
+# Vzory souboru, ktere se nezalohuji.
 $ExcludeFiles = @(
     "*.tmp", "~*", "*.part", "desktop.ini", "Thumbs.db", "*.lock"
 )
 
+$CfgDir   = Join-Path $env:APPDATA 'ssd-backup'
+$PassFile = Join-Path $CfgDir 'restic-password'
+
 # --------------------------------------------------------------------------
-# Pomůcky
+# Pomucky
 # --------------------------------------------------------------------------
 
 function Ask([string]$Question, [string]$Default = 'N') {
@@ -77,22 +91,29 @@ function Show-Banner {
     $rule = ('=' * 46)
     Write-Host ""
     Write-Host "  $rule"                          -ForegroundColor Cyan
-    Write-Host "   * SSD BACKUP  -  osobni soubory" -ForegroundColor Cyan
-    Write-Host "   zaloha domacich dat na externi disk" -ForegroundColor DarkGray
+    Write-Host "   * SSD BACKUP  -  osobni soubory (restic)" -ForegroundColor Cyan
+    Write-Host "   verzovana, sifrovana zaloha domacich dat" -ForegroundColor DarkGray
     Write-Host "   by @ret3030"                    -ForegroundColor Magenta
     Write-Host "  $rule"                          -ForegroundColor Cyan
     Write-Host ""
 }
 
 function Test-Prereqs {
-    if (-not (Get-Command robocopy.exe -ErrorAction SilentlyContinue)) {
-        Write-Error "robocopy nenalezen. Je soucasti Windows (Vista+) v C:\Windows\System32 - zkontroluj PATH."
+    if (-not (Get-Command restic.exe -ErrorAction SilentlyContinue)) {
+        Write-Error "restic nenalezen. Nainstaluj: winget install restic.restic  (nebo viz restic.net)"
     }
-    if ($PSVersionTable.PSVersion.Major -lt 3) {
-        Warn2 "Stara verze PowerShellu ($($PSVersionTable.PSVersion)). Doporuceno 3+ (Windows 8 / Server 2012 a novejsi)."
-    }
-    $rv = (Get-Command robocopy.exe).Version
-    Ok "Prerekvizity v poradku (robocopy $rv, PowerShell $($PSVersionTable.PSVersion))."
+    $v = (& restic version) -replace '^restic\s+([0-9.]+).*', '$1'
+    Ok "Prerekvizity v poradku (restic $v)."
+}
+
+function Ensure-Password {
+    if ((Test-Path -LiteralPath $PassFile) -and (Get-Item $PassFile).Length -gt 0) { return }
+    New-Item -ItemType Directory -Force -Path $CfgDir | Out-Null
+    $bytes = New-Object byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    [Convert]::ToBase64String($bytes) | Out-File -Encoding ascii -NoNewline $PassFile
+    Warn2 "Vygenerovano nove heslo repozitare: $PassFile"
+    Warn2 "BEZ NEJ SE K ZALOZE NEDOSTANES. Udelej si jeho kopii i mimo tenhle pocitac."
 }
 
 Show-Banner
@@ -102,13 +123,10 @@ Test-Prereqs
 # Průvodce (když není zadaný -Dest)
 # --------------------------------------------------------------------------
 
-$RunRealAfter = $false
-
 if (-not $Dest -and -not $Yes) {
     Write-Host "== Průvodce zálohou ==`n"
     Write-Host "Hledám připojené disky…"
 
-    # Vypíšeme jednotky typu 'vyměnitelné' a 'pevné' kromě systémové
     $drives = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2 OR DriveType=3" |
         Where-Object { $_.DeviceID -ne $env:SystemDrive } |
         Sort-Object DeviceID
@@ -137,13 +155,8 @@ if (-not $Dest -and -not $Yes) {
     }
     Write-Host ""
 
-    if (-not $NoMirror) {
-        if (-not (Ask "Zrcadlit? (co smažeš doma, zmizí i na SSD)" 'N')) { $NoMirror = $true }
-    }
-
     if (Ask "Spustit nejdřív zkušební běh (nic nezapíše)?" 'A') {
         $DryRun = $true
-        $RunRealAfter = $true
     }
     Write-Host ""
 }
@@ -165,73 +178,71 @@ if ($DestFull -eq "$env:USERPROFILE\" -or $DestFull -eq $env:USERPROFILE -or $De
 }
 
 $HostDir = "$env:COMPUTERNAME-$env:USERNAME"
-$Target  = Join-Path $DestFull "backup\$HostDir"
-New-Item -ItemType Directory -Force -Path $Target | Out-Null
+$Repo    = Join-Path $DestFull "backup\$HostDir\restic-repo"
+New-Item -ItemType Directory -Force -Path (Split-Path $Repo -Parent) | Out-Null
 
-# --------------------------------------------------------------------------
-# Jeden průchod robocopy
-# --------------------------------------------------------------------------
+$Existing = @($Sources | Where-Object { Test-Path -LiteralPath $_ })
+if ($Existing.Count -eq 0) {
+    Write-Error "Nenašel jsem žádnou ze zdrojových složek. Uprav pole `$Sources ve skriptu."
+}
 
-function Invoke-Backup([bool]$IsDry) {
-    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $suffix = if ($IsDry) { '-dryrun' } else { '' }
-    $log = Join-Path $DestFull "backup\backup-$stamp-$HostDir$suffix.log"
+Ensure-Password
+$env:RESTIC_REPOSITORY   = $Repo
+$env:RESTIC_PASSWORD_FILE = $PassFile
 
-    # /E = i podsložky  /XJ = ignorovat junctiony  /R:1 /W:1 = rychlé selhání
-    # /NP = bez procent  /NDL = bez výpisu složek  /XA:SH = přeskočit systémové+skryté
-    $roboArgs = @('/E', '/XJ', '/R:1', '/W:1', '/NP', '/NDL', '/XA:SH')
-    if (-not $NoMirror) { $roboArgs += '/MIR' }
-    if ($IsDry)         { $roboArgs += '/L' }
-    if ($ExcludeDirs.Count)  { $roboArgs += '/XD'; $roboArgs += $ExcludeDirs }
-    if ($ExcludeFiles.Count) { $roboArgs += '/XF'; $roboArgs += $ExcludeFiles }
+Step "Cíl zálohy"
+Write-Host "  Repozitář $Repo"
+Write-Host "  Zdrojů    $($Existing.Count) složek"
 
-    $mode = if ($NoMirror) { 'jen přidává' } else { 'zrcadlo (maže i na SSD)' }
-    Write-Host ("== Záloha" + $(if ($IsDry) { " (ZKUŠEBNÍ BĚH – nic se nezapíše)" } else { "" }) + " ==")
-    Write-Host "Cíl   : $Target"
-    Write-Host "Režim : $mode"
-    Write-Host "Log   : $log`n"
+if (-not (Test-Path -LiteralPath (Join-Path $Repo 'config'))) {
+    Step "Zakládám nový restic repozitář…"
+    & restic init | Out-Null
+    Ok "Repozitář založen."
+}
 
-    $maxRc = 0
-    foreach ($src in $Sources) {
-        if (-not (Test-Path -LiteralPath $src)) {
-            Write-Host "přeskakuji (neexistuje): $src"
-            continue
-        }
-        $name = Split-Path $src -Leaf
-        $destDir = Join-Path $Target $name
-        Write-Host "--> $src"
-        robocopy $src $destDir @roboArgs /TEE /LOG+:$log
-        if ($LASTEXITCODE -gt $maxRc) { $maxRc = $LASTEXITCODE }
-    }
-
-    Write-Host ""
-    if ($maxRc -lt 8) {
-        Write-Host "Hotovo. Návratový kód robocopy: $maxRc (0-7 = v pořádku)."
-    } else {
-        Write-Warning "Robocopy hlásí chyby (kód $maxRc). Zkontroluj log: $log"
-    }
-    return $maxRc
+if ($Snapshots) {
+    Step "Historie záloh"
+    & restic snapshots
+    exit 0
 }
 
 # --------------------------------------------------------------------------
-# Běh
+# Záloha přes restic
 # --------------------------------------------------------------------------
+
+function Invoke-Backup([bool]$IsDry) {
+    $resticArgs = @('backup') + $Existing + @('--tag', 'ssd-backup', '--verbose')
+    foreach ($d in $ExcludeDirs)  { $resticArgs += @('--exclude', $d) }
+    foreach ($f in $ExcludeFiles) { $resticArgs += @('--exclude', $f) }
+    if ($IsDry) { $resticArgs += '--dry-run' }
+
+    Write-Host ("== Záloha" + $(if ($IsDry) { " (ZKUŠEBNÍ BĚH – nic se nezapíše)" } else { "" }) + " ==")
+    Write-Host ""
+
+    & restic @resticArgs
+    return $LASTEXITCODE
+}
 
 if ($DryRun) {
     [void](Invoke-Backup $true)
-    if ($RunRealAfter) {
+    Write-Host ""
+    if (Ask "Pokračovat teď doopravdy?" 'A') {
         Write-Host ""
-        if (Ask "Pokračovat teď doopravdy?" 'A') {
-            $DryRun = $false
-            Write-Host ""
-        } else {
-            Write-Host "Ukončeno. Nic se nezapsalo."
-            exit 0
-        }
     } else {
+        Write-Host "Ukončeno. Nic se nezapsalo."
         exit 0
     }
 }
 
 $rc = Invoke-Backup $false
-if ($rc -lt 8) { exit 0 } else { exit 1 }
+if ($rc -eq 0) {
+    Ok "Hotovo bez chyb."
+    if ($Prune -gt 0) {
+        Step "Prořezávám staré snapshoty (ponechám posledních $Prune)…"
+        & restic forget --keep-last $Prune --prune
+    }
+    exit 0
+} else {
+    Write-Warning "restic hlásí chybu (kód $rc)."
+    exit 1
+}
