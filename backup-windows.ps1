@@ -66,7 +66,12 @@ $ExcludeDirs = @(
     "Dropbox"
     "Google Drive", "GoogleDrive"
     ".cache", "Cache", "Caches", "GPUCache", "Code Cache", "CacheStorage"
-    "Temp", "Crashpad", "CrashDumps"
+    # Electron/Chromium smeti (VS Code, Discord, Slack, Teams...) - jen cache,
+    # navic to aplikace drzi otevrene, takze bez VSS jen sypou chyby.
+    "DawnCache", "DawnGraphiteCache", "DawnWebGPUCache"
+    "ShaderCache", "GrShaderCache", "blob_storage"
+    "Service Worker", "Crashpad", "CrashDumps"
+    "Temp"
     "node_modules", "__pycache__", ".venv", "venv"
     ".gradle"
     '$Recycle.Bin', 'System Volume Information'
@@ -100,6 +105,7 @@ $ExcludePaths = @(
 # Vzory souboru, ktere se nezalohuji.
 $ExcludeFiles = @(
     "*.tmp", "~*", "*.part", "desktop.ini", "Thumbs.db", "*.lock"
+    "LOCK", "lockfile"                                       # zamky Electron/leveldb
     "NTUSER.DAT*", "ntuser.dat*", "*.blf", "*.regtrans-ms"   # registrovy hive, vzdy zamceny
     "hiberfil.sys", "pagefile.sys", "swapfile.sys"
 )
