@@ -11,12 +11,17 @@
         .\backup-windows.ps1 -Dest E:\ -Yes           # preskocit dotazy (Planovac uloh)
         .\backup-windows.ps1 -Dest E:\ -Snapshots     # vypsat historii zaloh
         .\backup-windows.ps1 -Dest E:\ -Prune 10      # po zaloze ponechat jen poslednich 10 snapshotu
+        .\backup-windows.ps1 -Dest E:\ -NoVss        # nepouzivat VSS (i kdyz bezis jako admin)
 
     Pokud skript nejde spustit kvuli politice, spust jednorazove:
         powershell -ExecutionPolicy Bypass -File .\backup-windows.ps1
 
-    Co se zalohuje: slozky v $Sources nize (vychozi = bezne osobni slozky profilu).
-    Co se NEzalohuje: nazvy slozek v $ExcludeDirs (ownCloud, Nextcloud, OneDrive, Dropbox, cache, ...).
+    Co se zalohuje: cesty v $Sources nize (vychozi = CELY uzivatelsky profil).
+    Co se NEzalohuje: $ExcludeDirs (nazvy kdekoli ve stromu), $ExcludePaths (konkretni
+    cesty) a $ExcludeFiles (vzory souboru).
+
+    TIP: spust PowerShell jako spravce. Skript pak zalohuje pres stinovou kopii (VSS),
+    takze projdou i soubory, ktere ma zrovna otevrene jina aplikace (posta, prohlizec).
 
     Heslo repozitare: %APPDATA%\ssd-backup\restic-password (pri prvnim behu se vygeneruje samo -
     BEZ NEJ SE K ZALOZE NEDOSTANES, udelej si z nej i vlastni kopii mimo tenhle disk).
@@ -29,7 +34,8 @@ param(
     [switch]$DryRun,
     [switch]$Yes,
     [switch]$Snapshots,
-    [int]$Prune = 0
+    [int]$Prune = 0,
+    [switch]$NoVss
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,34 +44,59 @@ $ErrorActionPreference = 'Stop'
 # Nastaveni - klidne si uprav
 # --------------------------------------------------------------------------
 
+# Vychozi = CELY uzivatelsky profil. Vsechno osobni je uvnitr; smeti se odrezava
+# nize v $ExcludePaths / $ExcludeDirs. Data mimo profil (jina pismena disku,
+# spolecne slozky) si pridej sem jako dalsi radky.
 $Sources = @(
-    "$env:USERPROFILE\Documents"
-    "$env:USERPROFILE\Desktop"
-    "$env:USERPROFILE\Pictures"
-    "$env:USERPROFILE\Videos"
-    "$env:USERPROFILE\Music"
-    "$env:USERPROFILE\Downloads"
-    "$env:USERPROFILE\Favorites"
-    "$env:USERPROFILE\Projects"
+    "$env:USERPROFILE"
+    # "D:\Data"
+    # "$env:PUBLIC"
 )
 
 # Nazvy slozek, ktere se nikdy nezalohuji (kdekoli ve stromu).
 $ExcludeDirs = @(
     "owncloud", "ownCloud", "OwnCloud"
     "Nextcloud", "nextcloud"
-    "OneDrive", "OneDriveTemp"
+    "OneDrive", "OneDriveTemp"          # cloud ma vlastni zalohu; smaz radek, kdyz mas do OneDrive presmerovane Dokumenty
     "Dropbox"
     "Google Drive", "GoogleDrive"
-    ".cache", "Cache", "GPUCache", "Code Cache"
+    ".cache", "Cache", "Caches", "GPUCache", "Code Cache", "CacheStorage"
+    "Temp", "Crashpad", "CrashDumps"
     "node_modules", "__pycache__", ".venv", "venv"
-    ".gradle", "target", "bin", "obj"
+    ".gradle"
     '$Recycle.Bin', 'System Volume Information'
     "restic-repo"
+    # Pozor: tyhle nazvy sedi KDEKOLI ve stromu. Zamerne tu uz NENI "bin" / "obj"
+    # / "target" - pri zaloze celeho profilu by vyhodily i osobni slozky.
+)
+
+# Konkretni cesty (ne jen nazvy) - smeti a systemove veci, ktere nejdou precist.
+$ExcludePaths = @(
+    "$env:USERPROFILE\AppData\Local"      # cache, instalatory, balicky: desitky GB, nic osobniho
+    "$env:USERPROFILE\AppData\LocalLow"
+    "$env:USERPROFILE\AppData\Roaming\Microsoft\Windows\Recent"
+    # Skryte legacy junction pointy v korenu profilu: nejdou precist (Access denied)
+    # a zacykli pruchod stromem.
+    "$env:USERPROFILE\Application Data"
+    "$env:USERPROFILE\Local Settings"
+    "$env:USERPROFILE\My Documents"
+    "$env:USERPROFILE\NetHood"
+    "$env:USERPROFILE\PrintHood"
+    "$env:USERPROFILE\Recent"
+    "$env:USERPROFILE\SendTo"
+    "$env:USERPROFILE\Cookies"
+    "$env:USERPROFILE\Start Menu"
+    "$env:USERPROFILE\Templates"
+    "$env:USERPROFILE\Searches"
+    # Neco z AppData\Local presto chces? Pridej si to zpatky nahoru do $Sources, napr.:
+    # "$env:USERPROFILE\AppData\Local\Thunderbird"
 )
 
 # Vzory souboru, ktere se nezalohuji.
 $ExcludeFiles = @(
     "*.tmp", "~*", "*.part", "desktop.ini", "Thumbs.db", "*.lock"
+    "NTUSER.DAT*", "ntuser.dat*", "*.blf", "*.regtrans-ms"   # registrovy hive, vzdy zamceny
+    "hiberfil.sys", "pagefile.sys", "swapfile.sys"
 )
 
 $CfgDir   = Join-Path $env:APPDATA 'ssd-backup'
@@ -104,6 +135,12 @@ function Test-Prereqs {
     }
     $v = (& restic version) -replace '^restic\s+([0-9.]+).*', '$1'
     Ok "Prerekvizity v poradku (restic $v)."
+}
+
+function Test-Admin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return (New-Object Security.Principal.WindowsPrincipal $id).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 function Ensure-Password {
@@ -190,9 +227,21 @@ Ensure-Password
 $env:RESTIC_REPOSITORY   = $Repo
 $env:RESTIC_PASSWORD_FILE = $PassFile
 
+$UseVss = $false
+if (-not $NoVss -and -not $Snapshots) {
+    if (Test-Admin) {
+        $UseVss = $true
+    } else {
+        Warn2 "Neběžíš jako správce – bez stínové kopie (VSS). Soubory, které má"
+        Warn2 "zrovna otevřené jiná aplikace (pošta, prohlížeč), restic přeskočí."
+        Warn2 "Chceš je taky? Spusť PowerShell jako správce."
+    }
+}
+
 Step "Cíl zálohy"
 Write-Host "  Repozitář $Repo"
-Write-Host "  Zdrojů    $($Existing.Count) složek"
+Write-Host "  Zdrojů    $($Existing.Count)"
+if ($UseVss) { Write-Host "  Režim     stínová kopie (VSS) – projdou i zamčené soubory" }
 
 if (-not (Test-Path -LiteralPath (Join-Path $Repo 'config'))) {
     Step "Zakládám nový restic repozitář…"
@@ -211,10 +260,13 @@ if ($Snapshots) {
 # --------------------------------------------------------------------------
 
 function Invoke-Backup([bool]$IsDry) {
-    $resticArgs = @('backup') + $Existing + @('--tag', 'ssd-backup', '--verbose')
-    foreach ($d in $ExcludeDirs)  { $resticArgs += @('--exclude', $d) }
-    foreach ($f in $ExcludeFiles) { $resticArgs += @('--exclude', $f) }
-    if ($IsDry) { $resticArgs += '--dry-run' }
+    $resticArgs = @('backup') + $Existing + @('--tag', 'ssd-backup', '--verbose', '--exclude-caches')
+    # --iexclude = bez ohledu na velikost pismen (Windows tak bere cesty tak jako tak)
+    foreach ($d in $ExcludeDirs)  { $resticArgs += @('--iexclude', $d) }
+    foreach ($d in $ExcludePaths) { $resticArgs += @('--iexclude', $d) }
+    foreach ($f in $ExcludeFiles) { $resticArgs += @('--iexclude', $f) }
+    if ($UseVss) { $resticArgs += '--use-fs-snapshot' }
+    if ($IsDry)  { $resticArgs += '--dry-run' }
 
     Write-Host ("== Záloha" + $(if ($IsDry) { " (ZKUŠEBNÍ BĚH – nic se nezapíše)" } else { "" }) + " ==")
     Write-Host ""
@@ -235,8 +287,16 @@ if ($DryRun) {
 }
 
 $rc = Invoke-Backup $false
-if ($rc -eq 0) {
-    Ok "Hotovo bez chyb."
+
+# restic: 0 = vse OK, 3 = snapshot vznikl, ale nektere soubory nesly precist
+# (zamcene / bez opravneni), 1 = skutecna chyba.
+if ($rc -eq 0 -or $rc -eq 3) {
+    if ($rc -eq 3) {
+        Warn2 "Snapshot vznikl, ale některé soubory nešly přečíst (zamčené nebo bez"
+        Warn2 "oprávnění). Výpis je nahoře. Spuštění jako správce jich většinu vyřeší."
+    } else {
+        Ok "Hotovo bez chyb."
+    }
     if ($Prune -gt 0) {
         Step "Prořezávám staré snapshoty (ponechám posledních $Prune)…"
         & restic forget --keep-last $Prune --prune

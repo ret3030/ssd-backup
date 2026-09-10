@@ -77,6 +77,8 @@ ne kvůli omezením zálohy.
 ### Návratový kód
 
 `0` = záloha proběhla · `1` = restic hlásil chybu · `2` = špatné použití.
+(Windows navíc bere resticův kód `3` – snapshot vznikl, ale některé soubory nešly
+přečíst – jako úspěch s varováním.)
 
 ## macOS
 
@@ -98,7 +100,20 @@ ne kvůli omezením zálohy.
 .\backup-windows.ps1 -Dest E:\ -Yes        # bez dotazů (Plánovač úloh)
 .\backup-windows.ps1 -Dest E:\ -Snapshots
 .\backup-windows.ps1 -Dest E:\ -Prune 10
+.\backup-windows.ps1 -Dest E:\ -NoVss      # bez stínové kopie
 ```
+
+**Spouštěj PowerShell jako správce.** Skript pak zálohuje přes stínovou kopii svazku
+(VSS, restic `--use-fs-snapshot`), takže projdou i soubory, které má zrovna otevřená
+jiná aplikace – pošta, prohlížeč, databáze. Bez práv správce se takové soubory
+přeskočí a restic skončí kódem `3` (snapshot vznikne, ale je neúplný).
+
+Windowsová verze zálohuje **celý uživatelský profil** (`C:\Users\<ty>`) a smetí
+odřezává výjimkami – `AppData\Local` a `AppData\LocalLow` (cache, instalátory,
+balíčky), skryté legacy junction pointy v kořeni profilu (`My Documents`,
+`Local Settings`, `Cookies`… – jdou jen do prázdna a hlásí „Access denied"),
+registrové hive a cloudové složky. Data mimo profil (jiná písmena disků) si přidej
+do `$Sources` nahoře ve skriptu.
 
 Kdyby to blokovala execution policy:
 
@@ -124,9 +139,9 @@ jiném počítači stejné heslo z tohoto souboru)
 
 ## Co se zálohuje / nezálohuje
 
-- **Zálohuje se:** složky v proměnné `SOURCES` / `$Sources` na začátku skriptu –
-  výchozí jsou běžné osobní složky (Dokumenty, Plocha, Obrázky, Video, Hudba,
-  Stažené, Projects a vybrané dotfiles / `.config`).
+- **Zálohuje se:** složky v proměnné `SOURCES` / `$Sources` na začátku skriptu. Na
+  Linuxu/macOS jsou to běžné osobní složky (Dokumenty, Plocha, Obrázky, Video, Hudba,
+  Stažené, Projects a vybrané dotfiles / `.config`), na Windows **celý profil**.
 - **Nezálohuje se:** `owncloud`, `Nextcloud`, `iCloud Drive`, `OneDrive`,
   `Dropbox`, `Google Drive`, cache, koš, `node_modules`, `__pycache__`, build
   složky… – viz `EXCLUDES` / `$ExcludeDirs`.
