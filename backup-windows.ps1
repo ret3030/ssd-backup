@@ -1,4 +1,4 @@
-<#
+﻿<#
     Zaloha osobnich souboru na externi SSD (Windows) pres restic.
 
     Restic uklada verzovane, deduplikovane a sifrovane snapshoty - zadne mazani ani
@@ -39,6 +39,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Windows PowerShell 5.1 posila na konzoli ANSI codepage - bez tohohle by se
+# diakritika ve vypisech rozsypala. (Soubor sam musi mit UTF-8 BOM, jinak ho
+# 5.1 vubec spravne neprecte.)
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
 # --------------------------------------------------------------------------
 # Nastaveni - klidne si uprav
@@ -138,9 +143,13 @@ function Test-Prereqs {
 }
 
 function Test-Admin {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    return (New-Object Security.Principal.WindowsPrincipal $id).IsInRole(
-        [Security.Principal.WindowsBuiltInRole]::Administrator)
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        return (New-Object Security.Principal.WindowsPrincipal $id).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false   # nedostupne (jiny host / non-Windows) -> ber to jako "ne"
+    }
 }
 
 function Ensure-Password {
@@ -271,7 +280,10 @@ function Invoke-Backup([bool]$IsDry) {
     Write-Host ("== Záloha" + $(if ($IsDry) { " (ZKUŠEBNÍ BĚH – nic se nezapíše)" } else { "" }) + " ==")
     Write-Host ""
 
-    & restic @resticArgs
+    # Out-Host, ne holy vystup: jinak by se cely vypis resticu stal navratovou
+    # hodnotou funkce ($rc by bylo pole radku, ne kod) a pri -DryRun by se
+    # neukazalo vubec nic.
+    & restic @resticArgs | Out-Host
     return $LASTEXITCODE
 }
 

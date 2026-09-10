@@ -121,6 +121,11 @@ Kdyby to blokovala execution policy:
 powershell -ExecutionPolicy Bypass -File .\backup-windows.ps1
 ```
 
+> `backup-windows.ps1` je uložený v **UTF-8 s BOM** – Windows PowerShell 5.1 čte
+> `.ps1` bez BOM v ANSI codepage a diakritika mu rozbije parser. Když soubor
+> upravuješ, zachovej kódování (`Set-Content -Encoding UTF8`, ve VS Code
+> „UTF-8 with BOM").
+
 ## Kam se data ukládají
 
 ```
