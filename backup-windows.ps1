@@ -274,27 +274,33 @@ if ($Snapshots) {
 # Záloha přes restic
 # --------------------------------------------------------------------------
 
+# Exit kod resticu se predava tudy, ne navratovou hodnotou funkce - viz nize.
+$script:LastRc = 0
+
 function Invoke-Backup([bool]$IsDry) {
-    $resticArgs = @('backup') + $Existing + @('--tag', 'ssd-backup', '--verbose', '--exclude-caches')
+    $resticArgs = @('backup') + $Existing + @('--tag', 'ssd-backup', '--exclude-caches')
     # --iexclude = bez ohledu na velikost pismen (Windows tak bere cesty tak jako tak)
     foreach ($d in $ExcludeDirs)  { $resticArgs += @('--iexclude', $d) }
     foreach ($d in $ExcludePaths) { $resticArgs += @('--iexclude', $d) }
     foreach ($f in $ExcludeFiles) { $resticArgs += @('--iexclude', $f) }
     if ($UseVss) { $resticArgs += '--use-fs-snapshot' }
-    if ($IsDry)  { $resticArgs += '--dry-run' }
+    # Pri zkusebnim behu chces videt seznam souboru; pri ostrem staci prubeh,
+    # protoze --verbose zaplavi konzoli a prekryje ukazatel postupu.
+    if ($IsDry)  { $resticArgs += @('--dry-run', '--verbose') }
 
     Write-Host ("== Záloha" + $(if ($IsDry) { " (ZKUŠEBNÍ BĚH – nic se nezapíše)" } else { "" }) + " ==")
     Write-Host ""
 
-    # Out-Host, ne holy vystup: jinak by se cely vypis resticu stal navratovou
-    # hodnotou funkce ($rc by bylo pole radku, ne kod) a pri -DryRun by se
-    # neukazalo vubec nic.
-    & restic @resticArgs | Out-Host
-    return $LASTEXITCODE
+    # ZADNA roura ani Out-Host: restic si overuje, jestli pise do terminalu, a
+    # za rourou vypne ukazatel postupu. Vystup proto posilame primo na konzoli.
+    # Kvuli tomu se ale nesmi pouzit "return" - navratova hodnota funkce by
+    # pobrala cely vypis resticu misto cisla. Exit kod jde skriptovou promennou.
+    & restic @resticArgs
+    $script:LastRc = $LASTEXITCODE
 }
 
 if ($DryRun) {
-    [void](Invoke-Backup $true)
+    Invoke-Backup $true
     Write-Host ""
     if (Ask "Pokračovat teď doopravdy?" 'A') {
         Write-Host ""
@@ -304,7 +310,8 @@ if ($DryRun) {
     }
 }
 
-$rc = Invoke-Backup $false
+Invoke-Backup $false
+$rc = $script:LastRc
 
 # restic: 0 = vse OK, 3 = snapshot vznikl, ale nektere soubory nesly precist
 # (zamcene / bez opravneni), 1 = skutecna chyba.
