@@ -766,8 +766,10 @@ run_backup() {
 
   opts=( backup "${EXISTING[@]}" --tag ssd-backup )
   for pat in "${EXCLUDES[@]}"; do opts+=( --exclude="$pat" ); done
+  # --verbose jen pri zkusebnim behu: tam chces videt seznam souboru.
+  # Pri ostrem behu zaplavi terminal a odroluje resticuv ukazatel postupu.
+  # Pozor, --verbose je u resticu pocitadlo - dvakrat = uroven 2 = jeste vic vypisu.
   (( dry )) && opts+=( --dry-run --verbose )
-  [[ -t 1 ]] && opts+=( --verbose )
 
   local hdr="Záloha"
   (( dry )) && hdr="Záloha  ${YL}(ZKUŠEBNÍ BĚH – nic se nezapíše)${R}"
